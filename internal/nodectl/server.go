@@ -282,14 +282,18 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 	// same headroom and then over-subscribe it in separate State.Admit calls.
 	// Replays above are excluded because they replace an already charged upper
 	// bound rather than introduce a new consumer.
+	launch, identityErr := s.Admission.resolveLaunch(req.SandboxID, peerPID)
+	if identityErr != nil {
+		return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Reason: "launch_identity", Msg: identityErr.Error()}
+	}
 	s.Admission.queueMu.Lock()
-	oc := s.Admission.AnalyzeRequest(req)
+	oc := s.Admission.analyzeLaunch(req, launch)
 	switch oc.Status {
 	case OutcomeAdmitted:
 		if !s.Admission.ConsumeToken() {
 			// Race: another admit took the token. Re-evaluate (which may
 			// now be short-term-block → queue).
-			oc = s.Admission.AnalyzeRequest(req)
+			oc = s.Admission.analyzeLaunch(req, launch)
 		}
 	}
 	if oc.Status == OutcomeAdmitted {
@@ -298,16 +302,17 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 		}
 		resp, err := s.buildAdmitOK(conn, peerPID, req, token)
 		s.Admission.queueMu.Unlock()
-		if err != nil {
-			return &Message{
-				Type:   TypeAdmitResponse,
-				Status: StatusRejected,
-				Msg:    err.Error(),
-			}
+		if err == nil {
+			return resp
 		}
-		return resp
+		var wait *AdmissionWaitError
+		if !errors.As(err, &wait) {
+			return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Msg: err.Error()}
+		}
+		oc = wait.Outcome
+	} else {
+		s.Admission.queueMu.Unlock()
 	}
-	s.Admission.queueMu.Unlock()
 
 	switch oc.Status {
 	case OutcomePreCheckReject, OutcomeLongTermReject:
@@ -319,8 +324,10 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 		}
 
 	case OutcomeShortTermBlock:
+		s.State.RecordAdmissionWait(req.SandboxID, launch, initialReservationBudget(req))
 		_, ok := s.Admission.Enqueue(req, conn, peerPID)
 		if !ok {
+			s.State.ForgetAdmissionWait(req.SandboxID, launch.Identity)
 			return &Message{
 				Type:   TypeAdmitResponse,
 				Status: StatusRejected,
@@ -354,6 +361,14 @@ func (s *Server) BuildAdmitOKFromQueue(p *PendingAdmit) (*Message, error) {
 // the AdmitResponse message. Caller has already token-consumed.
 func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *string) (*Message, error) {
 	spec := admitSpecFromRequest(conn, peerPID, req)
+	launch, err := s.Admission.resolveLaunch(req.SandboxID, peerPID)
+	if err != nil {
+		return nil, err
+	}
+	if launch.SavedSource && req.AllocatableAtSnapshot == 0 {
+		return nil, fmt.Errorf("saved-source launch requires BudgetAtSnapshot")
+	}
+	spec.Admission = &launch
 	leasePath := ""
 	if slices.Contains(req.ClientFeatures, FeatureStateSyncV1) {
 		if s.Inventory == nil {

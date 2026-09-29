@@ -51,7 +51,7 @@ func (p ResourceProbe) SandboxResourceStats(sandboxID string) (api.ResourceStats
 var _ orch.ResourceProbe = ResourceProbe{}
 var _ orch.SandboxResourceProvider = ResourceProbe{}
 
-func StartResourceController(ctx context.Context, cfg *publicconfig.ResourceListenConfig, resolved *nodectl.Resolved, managedRunRoot string, logger *slog.Logger) (orch.ResourceProbe, error) {
+func StartResourceController(ctx context.Context, cfg *publicconfig.ResourceListenConfig, resolved *nodectl.Resolved, managedRunRoot string, logger *slog.Logger, owners ...*orch.Orchestrator) (orch.ResourceProbe, error) {
 	if resolved == nil {
 		return nil, fmt.Errorf("resolved resource_listen configuration is required")
 	}
@@ -77,8 +77,27 @@ func StartResourceController(ctx context.Context, cfg *publicconfig.ResourceList
 		},
 		Logf: func(format string, args ...any) { resourceLogger.Info(fmt.Sprintf(format, args...)) },
 	}
+	if err := state.ConfigurePressure(resolved.Pressure, nodectl.PressureRecord{}); err != nil {
+		return nil, err
+	}
+	var owner *orch.Orchestrator
+	if len(owners) > 0 {
+		owner = owners[0]
+	}
+	if owner != nil {
+		if err := owner.ConfigureMemoryPressure(ctx, state, admission, resolved.Pressure); err != nil {
+			return nil, err
+		}
+	}
 	if err := server.Listen(); err != nil {
 		return nil, err
+	}
+	if owner != nil {
+		if err := owner.PersistMemoryPressure(ctx); err != nil {
+			_ = server.Stop()
+			_ = server.Owner.Close()
+			return nil, err
+		}
 	}
 	admission.SetWiring(state, resourceLogger.With("subsystem", "admission"),
 		func(pending *nodectl.PendingAdmit) (*nodectl.Message, error) {

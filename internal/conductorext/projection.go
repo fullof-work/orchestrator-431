@@ -11,6 +11,8 @@ func projectSandbox(sandbox *types.Sandbox) conductorextension.SandboxView {
 		return conductorextension.SandboxView{}
 	}
 	view := conductorextension.SandboxView{
+		PauseReason: sandbox.PauseReason, ResourceObligation: sandbox.ResourceObligation,
+		PressureVersion: sandbox.PressureVersion, RunningSinceUnixNano: sandbox.RunningSinceUnixNano,
 		ID: sandbox.ID, StableID: sandbox.StableID(), Profile: conductorextension.Profile(sandbox.Profile),
 		TemplateID: sandbox.TemplateID, State: conductorextension.SandboxState(sandbox.State), RunID: sandbox.RunID,
 		CreatedUnix: sandbox.CreatedUnix, DeadlineUnix: sandbox.DeadlineUnix, Metadata: cloneMap(sandbox.Metadata),

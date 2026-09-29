@@ -25,7 +25,7 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 8
+	schema uint32 = 9
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -73,6 +73,10 @@ type mmapHeader struct {
 }
 
 type mmapRecord struct {
+	PressureVersion      uint64
+	RunningSinceUnixNano int64
+	ResourceObligation   uint32
+	PauseReason          [32]byte
 	Seq                  uint64
 	Hash                 uint64
 	Status               uint32
@@ -391,6 +395,13 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 		}
 		return nil
 	}
+	// An intent-only pressure update must reach readers, but is not a failed
+	// launch response. Preserve the activation revision, including across Range.
+	if current, stable := readRecordSnapshot(rec); stable && current.status == statusPresent && current.hash == hashSID(in.SandboxID) && sameActivationRoute(current.entry, in) {
+		t.writeRoute(rec, in, gen, current.rev)
+		atomic.AddUint64(&t.header.GlobalRev, 1)
+		return nil
+	}
 	t.writeRoute(rec, in, gen, atomic.AddUint64(&t.header.GlobalRev, 1))
 	return nil
 }
@@ -560,6 +571,8 @@ func readRecordSnapshot(rec *mmapRecord) (recordSnapshot, bool) {
 			syncGen: atomic.LoadUint64(&rec.SyncGen),
 			rev:     atomic.LoadUint64(&rec.Rev),
 			entry: routesync.RouteEntry{
+				PauseReason: fixedString(rec.PauseReason[:]), ResourceObligation: rec.ResourceObligation != 0,
+				PressureVersion: rec.PressureVersion, RunningSinceUnixNano: rec.RunningSinceUnixNano,
 				SandboxID:              fixedString(rec.SandboxID[:]),
 				Profile:                fixedString(rec.Profile[:]),
 				TemplateID:             fixedString(rec.TemplateID[:]),
@@ -608,6 +621,13 @@ func (t *Table) writeRoute(rec *mmapRecord, entry routesync.RouteEntry, syncGen,
 
 func writeRecordSnapshot(rec *mmapRecord, snapshot recordSnapshot) {
 	startWrite(rec)
+	rec.PressureVersion = snapshot.entry.PressureVersion
+	rec.RunningSinceUnixNano = snapshot.entry.RunningSinceUnixNano
+	rec.ResourceObligation = 0
+	if snapshot.entry.ResourceObligation {
+		rec.ResourceObligation = 1
+	}
+	_ = putFixed(rec.PauseReason[:], snapshot.entry.PauseReason)
 	rec.Hash = snapshot.hash
 	rec.Status = snapshot.status
 	rec.SyncGen = snapshot.syncGen
@@ -798,6 +818,7 @@ func validateRouteFields(r routesync.RouteEntry) error {
 		{"traffic_access_token", r.TrafficAccessToken, maxAccessToken},
 		{"forward_access_token", r.ForwardAccessToken, maxAccessToken},
 		{"artifact_location", r.ArtifactLocation, maxArtifactLocation},
+		{"pause_reason", r.PauseReason, 32},
 		{"mmds_secret", r.MmdsSecret, maxMmdsSecret},
 		{"run_id", r.RunID, maxRunID},
 	}
@@ -855,4 +876,12 @@ func parentDir(path string) string {
 		}
 	}
 	return "."
+}
+
+func sameActivationRoute(a, b routesync.RouteEntry) bool {
+	a.PauseReason, b.PauseReason = "", ""
+	a.ResourceObligation, b.ResourceObligation = false, false
+	a.PressureVersion, b.PressureVersion = 0, 0
+	a.RunningSinceUnixNano, b.RunningSinceUnixNano = 0, 0
+	return a == b
 }

@@ -22,12 +22,14 @@ func (o *Orchestrator) SetExtensionObserver(observer ExtensionObserver) {
 }
 
 func (o *Orchestrator) observeSandboxUpsert(sandbox *types.Sandbox) {
+	o.observePressureSandbox(sandbox)
 	if o.extensionObserver != nil {
 		o.extensionObserver.SandboxUpsert(sandbox)
 	}
 }
 
 func (o *Orchestrator) observeSandboxDelete(sandbox *types.Sandbox) {
+	o.observeDeletedPressureSandbox(sandbox)
 	if o.extensionObserver != nil {
 		o.extensionObserver.SandboxDelete(sandbox)
 	}
@@ -64,7 +66,7 @@ func unlockEventFence(unlock func()) {
 // paths already hold that fence; this helper is needed only by import and is a
 // no-op when observation is disabled.
 func (o *Orchestrator) lockExtensionSandboxEvent(sandboxID string) func() {
-	if o.extensionObserver == nil {
+	if o.extensionObserver == nil && o.memoryPressure.Load() == nil {
 		return nil
 	}
 	return o.lifecycle.Lock(sandboxID)

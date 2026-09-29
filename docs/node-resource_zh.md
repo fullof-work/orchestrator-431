@@ -3,7 +3,7 @@
 # node-resource — 节点 reservation 控制器
 
 `node-ctl conductor serve` 可选地内置 node resource controller。它只处理节点侧
-reservation、admission、pool、水位、恢复 inventory 和统计投影。sandbox 的
+reservation、admission、pool、水位、恢复 inventory、压力 episode 和统计投影。压力 worker 通过 orchestrator 协调现有完整内存 Pause/Resume。sandbox 的
 guest memory observation、Cloud Hypervisor balloon、`memory.high`、cold/restore/
 snapshot 生命周期均由 sandboxer 自闭环管理,不属于 node controller。
 
@@ -133,8 +133,7 @@ reservation,原有 `memory.high` 继续对超过阈值的 host VMM charge 施加
 
 - `0 < NodeReservation <= Capacity`。
 - `reservedMemory = sum(live NodeReservation)`。
-- admission、pool、zone、ResourceProbe、cluster projected load 和 recovery
-  replacement 只使用 `NodeReservation` 聚合。
+- pool、RawZone、ResourceProbe allocated 与 recovery replacement 只聚合 NodeReservation；有效 Zone 另记录合格压力与尚未完成的恢复义务。
 - grow 只由 sandbox 发起;node 先记账再返回 grant。
 - shrink 只由 sandbox 在 balloon current 收敛且 `memory.high` 已按顺序处理后提交。
 - `Settled` 是生命周期事实,不从 `memory.current` 推导或改写 reservation。
@@ -151,15 +150,20 @@ controller 由 `node-ctl conductor serve` 的 `resource_listen` 启动,没有独
 node-ctl resource status [--socket PATH]
 node-ctl resource list   [--socket PATH]
 node-ctl resource drain  [--socket PATH] [--disable]
+node-ctl resource pressure [--socket CONTROL_SOCKET]
 ```
 
 `status` 展示 node budget、host reserved、operational margin、allocatable pool、
 reserved memory、startup in-flight、zone 和 recovery 数量。`list` 输出逐 sandbox
 reservation。`drain` 只禁止新 admission,不改变任何 live reservation。
 
+`pressure` 通过 conductor control socket（或 NODE_CTL_SOCKET）的 `GET /internal/admin/resource-pressure` 查询，沿用本地 admin 认证。返回有效/原始水位、进入原因/版本/时间、R/P/E、剩余 hold、保护额度、按阶段统计的 Q、清理屏障、最老等待、宿主安全压力、逐沙箱暂停原因/运行起点和有界最近操作结果。现役 resource reservation 协议不变。
+
 不存在 `resource grant` 或 `resource reclaim`。Headroom 属于 sandbox policy,应通过受支持的 sandbox 配置/生命周期输入选择,
 再由 sandbox 既有闭环根据 observation 收敛。这不引入 node 侧 live policy reload
 或直接 balloon/cgroup 调整命令。
+
+`worker_blocked=no_eligible_running_sandbox` 表示当前没有可安全换出的 running 对象；节点继续保守等待，不释放他人占账。
 
 ## 3. 配置
 
@@ -226,6 +230,15 @@ resource_listen:
     startup_ttl: 30s
     queue_ttl: 30s
     queue_max_depth: 256
+  pressure:
+    interval: 1s
+    failure_interval: 500ms
+    critical_after_rounds: 3
+    pause_after_rounds: 3
+    critical_exit_hold: 5s
+    red_to_yellow_hold: 30s
+    yellow_to_green_hold: 30s
+    minimum_run_time: 30s
 ```
 
 `operational_margin_factor` 从扣除 HostReserved 后的预算中保留 node safety margin。
@@ -234,10 +247,9 @@ reservation 的并发总量。admission `rate`/`burst` 是请求 token bucket,�
 Budget。
 
 controller preflight 要求 `host_reserved.memory < physical_memory`,并验证
-`0 <= operational_margin_factor < 1`、`0 <= low_factor < high_factor < 1`、
+`0 <= operational_margin_factor < 1`、`0 <= low_factor < high_factor < 1 - emergency_factor <= 1`、
 `0 <= emergency_factor < startup_factor <= 1` 和
-`0 < memory_grant_per_sec_factor <= 1`。非法值在计算 pool 前失败,不会进入无符号减法
-或 cluster load 投影。
+`0 < memory_grant_per_sec_factor <= 1`。最终 pool 必须为正，字节取整后要求 Ty < Tr < Tc。pressure 周期与 hold 为正，失败轮数为正，轮间隔至少 250ms，最短运行窗口非负。非法值在服务启动前失败。这些缺省值是调优起点，应在目标节点验证 capture/restore 时延及宿主净释放。
 
 `resource_listen.socket` 是 endpoint 的唯一配置源。node-ctl 以绝对路径 bind,并把父目录
 symlink 规范化为 owner lock、lease inventory 和 sandbox client 共用的 canonical identity;
@@ -271,19 +283,39 @@ StartupPool         = AllocatablePool * startup_factor
 减法使用不下溢的资源运算。所有 reservation 更新与 aggregate 更新位于同一 State
 临界区。插入或 recovery replacement 在修改索引前验证 aggregate 加法不会溢出。
 
-### 4.2 zone
+### 4.2 RawZone 与有效 Zone
 
-zone 仅由 `Reserved / AllocatablePool` 推导:
+令 R=Reserved、P=AllocatablePool、E=floor(P*emergency_factor)，
+Ty=floor(P*low_factor)、Tr=floor(P*high_factor)、Tc=P-E。
+RawZone 在 R<Ty 时为 green，Ty<=R<Tr 为 yellow，Tr<=R<Tc 为 red，
+R>=Tc 为 critical。零池在 preflight 拒绝，运行期防御性处理为 critical。
 
-| zone | 含义 |
-|---|---|
-| green | 正常 admission 和 grow |
-| yellow | 保守运行,仍可按 policy grant |
-| red | 拒绝新 admission;非 high urgency grow 暂缓 |
-| critical | 只保留安全/高紧急请求路径 |
+有效 Zone 是唯一节点水位权威。reservation 越界立即升级；合格持续内存不足也能从
+ green/yellow/red 直接进入 critical。请求来源不参与规则：
 
-zone 不读取 `MemAvailable`、balloon current、`memory.current` 或 sandbox lifecycle
-细节。
+| 有效水位 | 新建（含 Snapshot 模板） | 普通恢复 | 资源暂停恢复 | 资源 Pause |
+|---|---|---|---|---|
+| green | 有资格 | 有资格 | 有资格 | 不执行 |
+| yellow | 有资格 | 有资格 | 有资格 | 不执行 |
+| red | 不允许 | 有资格 | 有资格 | 不执行 |
+| critical | 不允许 | 不允许 | 有资格 | 继续合格不足后执行 |
+
+资格仍受完整 initial memory、启动协调、rate token 和既有认证/归属约束。
+直接 API、Proxy、内部路径、节点命令共用规则。Cluster 的选址偏好属于 #46；
+yellow 不是节点拒绝 cluster-create 的模式。NodeList 不新增动态水位或别名。
+
+失败轮次按同一有效需求及 launch/token 身份在时间推进后复核。并发重复、认证/参数错误、
+不可能满足的容量、drain、传输错误以及单纯启动槽/token 等待不计入。
+缺省三轮进入 critical，再三轮授权一次 Pause；下一次 Pause 需要新轮次。
+不足以形成 sandboxer 可执行 MemoryStep 的小额 reservation grant，不会抹去仍阻塞的需求。
+宿主 MemAvailable 低于 OperationalMargin 是独立安全输入，不改写 R、不授予操作保留区。
+
+Q 包含已受理的 capture intent、resource-pressure paused 及其 starting 恢复。
+即使 RawZone green，只要 Q>0 仍保持 critical。退出同时要求 Q=0、相关未核实清理结束、
+RawZone 低于 critical、无活跃合格内存阻塞，并连续满足 exit hold；只退出到 red。
+red 要求 RawZone 连续低于 red 达到自身 hold 后到 yellow；yellow 要求 RawZone 连续
+ green 达到自身 hold 后到 green。反弹重置计时，一次评估至多下降一级。
+重启在准入前装载 journal/义务，单调 hold 时钟重新开始。
 
 ### 4.3 runtime grant
 
@@ -296,6 +328,8 @@ response: GrantedDelta, NewReservation, Cooldown
 NewReservation = CurrentReservation + GrantedDelta
 0 <= GrantedDelta <= RequestedDelta
 ```
+
+普通新增 grow 按实际 P-R-E 再扣除其他受益者未兑现保护；high 可用 E，但总量不超过 P。有效 red/critical 本身不禁止 runtime grow。已占账 replay 不重复计费或扣 token。选中的一个 resume/grow 需求保护释放空间，直到 Admit、可执行进展、取消或未兑现 hold 到期；resume 优先于 grow。取消保护不释放 live reservation。
 
 sandbox 可收到 partial grant。sandboxer 会先累积 reservation,只有当额度足以表示一个
 64MiB 对齐 Budget 时才执行 balloon deflate,因此取整不会制造未保留内存。
@@ -395,21 +429,62 @@ sandbox RequestBudget(smaller baseline, delta=0) -> node release
 
 node 与 sandbox 流程没有共享状态机;reservation 请求/响应是唯一协调边界。
 
+### 6.4 资源 Pause、恢复与显式接管
+
+单 capture worker 按当前连续运行时间最长优先，不使用 CreatedUnix；running 提交重置
+起点。它复用现有内存 Pause：native exec quiesce/cleanup、Snapshot、旧 VM 退出和
+runner/network/resources 清理。不引入保留 VMM 的 pause、page swapper、exec 保留或新
+snapshot 格式。Checkpoint 必须落到磁盘，拒绝 tmpfs/ramfs；只有实际 Release/reconcile
+才能复用额度。Capture 失败退避，不丢弃已有保存源。
+
+单后台恢复 worker 按最老义务服务，与外部 Wake 共用 SID launch group。观察到稳定余量
+后准备恢复；随后 sandboxer 给出精确 I，最终资源准入等待完整预算才启动 VM。
+Starting 在实际 running 提交前仍属于 Q。最短运行窗口抑制刚恢复就换出，真实宿主安全
+压力可打破该软保护。有效需求可在 critical 中协调进一步 Pause，不等待被 Q 自身阻挡的
+降级。制品缺失/损坏、磁盘满/慢和容量失败保留源与义务并进入操作诊断。既有 Deadline
+终结、显式 Delete 通过同一生命周期所有者解除意图。
+
+已资源暂停的沙箱收到授权的缺省内存 Pause 时，直接接管现有 Snapshot 为普通显式暂停。
+Hook 仍执行，重取 lifecycle lock 后复核完整记录前置条件。窄 durable CAS 只改原因、义务、
+版本，保留身份、保存源、凭据和未完成清理；不重做 capture、不启动 VM。一次性取消未兑现
+资源恢复 hold 和 critical 豁免，State 仍为 paused 也发布更新。显式 capture 选项（包括显式
+ false）及 filesystem-only capture 均拒绝：保留源无法证明新的 capture 动作已经满足。
+Hook 也不能悄悄移除该动作后接管。普通重复 Pause 仍 409，starting 仍冲突。
+后续真实 Wake 按普通恢复规则执行，不增加永久用户暂停锁。接管不是 Release，也不能跳过
+critical 的完整退出条件。
+
+Sandbox 字段与小型 transition journal 共用现有 SQLite owner，在服务前结合 inventory
+重建。资源热路径不在 State.mu 内 capture、访问文件/网络或 SQLite；admission queue 先于
+State，State 不回调生命周期。只持久化低频生命周期/水位转换，不在 grant/heartbeat 重写
+全状态。节点 routesync、SHM、extension 投影只传递原因、义务、版本和运行起点等事实。
+
 ## 7. Admission 与调度投影
 
 ### 7.1 admission
 
-Cold 使用 `StartupBudgetMemory`,restore 使用 `AllocatableAtSnapshot`。选择后的
-InitialBudget 必须同时满足:
+Cold 使用 StartupBudgetMemory；内存 restore 使用现役 AllocatableAtSnapshot 字段，
+值仍为 sandboxer 的权威 BudgetAtSnapshot。RSS、压缩大小、guest 峰值、预计业务完成都
+不能替代它。Initial memory 必须在与 aggregate/grow 相同的 State 临界区内完整兑现。
 
-- 不超过 sandbox Capacity。
-- 不超过 `AllocatablePool` 和 startup pool 的单请求上界。
-- 当前 main headroom 和 startup headroom 足够。
-- node 未 drain,zone 未进入 red/critical。
-- admission token bucket 可用。
+Orchestrator 从最终 durable source 和解析后的 launch mode 分类；进程内 lookup 将
+resource 连接 peer PID 与当前 runner pidfile 核对。RPC 字段、metadata、模板 kind、
+urgency、Origin 均不能赋予恢复特权。Snapshot 模板创建仍是 Create。已 durable starting
+的操作在水位改变后保留同一 accepted 身份和异步生命周期；后续资源等待不伪装为无副作用拒绝。
 
-短期不足进入 FIFO queue;请求本身超过节点上界或 node protection 条件不允许时拒绝。
-任何路径都不会用较小 initial grant 继续启动/恢复。
+普通新建要求 I<=StartupPool、P-R-E 足够、启动预算和 rate token 可用。
+合法内存恢复使用串行完整预算通道：无其他启动占用，实际 I 不截断记账，到 Settled 或
+确认 Release 前不并发新启动。允许 I>StartupPool，必要时允许 I>P-E，但扣除其他保护后
+必须 R+I<=P。宿主/操作保留区在 P 之外，永不授予。完整保存源能力在显式 Pause 接管后仍
+保留；critical 豁免只属于当前资源恢复义务。I>P 明确失败并保留源。
+
+有界 admission queue 按 FIFO 年龄逐项复核，不被新近不再合格的 Create 或内存不足的
+队首阻挡。每次重查当前 launch 身份，超时/迟到工作只能取消同一身份的未兑现保护。
+启动槽/token 等待保留 resume 保护，但不累计内存失败轮次。Replay/StateSync 原子替换
+已有占账；断连、TTL 或不明清理不能把已占账消费者变成可用空间。
+
+
+显式 cold 恢复按普通恢复水位规则，不享有资源内存恢复的 critical 豁免或完整保存内存预算例外。
+可信 launch lookup 同时核对当前 runner pidfile 内容及同一已打开文件上的活跃 POSIX 锁持有者。
 
 ### 7.2 ResourceProbe 与 cluster load
 
@@ -467,8 +542,7 @@ admission token bucket 限制创建请求洪峰;startup pool 限制创建/恢复
 runtime grant token bucket 限制普通 grow 的节点总速率。high urgency 可使用 emergency
 pool。allocator 可返回 cooldown,由 sandbox 后续 observation/pressure event 重试。
 
-当前 reservation 与恢复状态通过 `resource status`、`resource list` 和 cluster heartbeat
-观察。异常 queue 诊断进入 conductor 标准日志出口,由部署环境统一采集与保留。重点口径包括:
+当前 reservation 与恢复状态通过 `resource status`、`resource list`、本地 `resource pressure` 和既有节点状态生产端观察。ResourceProbe 返回有效 Zone 与同一 reservation R/P；消费者不能由 R/P 重新推导有效水位。异常 queue 诊断进入 conductor 标准日志出口,由部署环境统一采集与保留。重点口径包括:
 
 - reserved memory / pool / zone。
 - startup in-flight。

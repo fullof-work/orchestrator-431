@@ -451,7 +451,7 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 | Kill | DELETE /sandboxes/{id} → 204 | Non-owner returns 404. Atomically transfer complete ownership into deleting, exclude from cache/full snapshots and publish route Delete before response. Finalizer cancels launch, fences runner, detaches under allocation fence, exactly clears durable network ownership, removes RunDir/BaseDir and hard-deletes row. Route Delete only withdraws projection; pending repeats are idempotent |
 | Resume | POST /sandboxes/{id}/connect | Body timeout in seconds and optional bool/null memory. Kuasar maps nil to auto, true to memory, false to cold. Paused atomically becomes starting with durable launch_mode before response. Missing targets may synchronously import paused state from X-Kuasar-Migration-Token, then use the same admission. Response does not wait for launch |
 | Exec session | POST /sandboxes/{id}/exec-sessions → 201 | X-API-KEY only. Mint execAccessToken; optional ttlSeconds, CEL conditions and X-Kuasar-Migration-Token. Does not create a guest process |
-| Pause | POST /sandboxes/{id}/pause → 204 | Omitted/null/true memory saves Snapshot S; false saves Sandbox E. False with snapshot-only merge/drop fields returns 400; already paused or starting returns 409 |
+| Pause | POST /sandboxes/{id}/pause → 204 | Omitted/null/true memory saves Snapshot S; false saves Sandbox E. False with snapshot-only merge/drop fields returns 400; ordinary already-paused or starting returns 409; default memory Pause adopts resource-paused state without recapture |
 | Timeout | POST /sandboxes/{id}/timeout | Body timeout in seconds resets TTL; starting permits a narrow-field update |
 
 Compatibility is bounded by the upstream API/SDK versions and actual tests. The upstream [Create](https://docs.e2b.dev/api-reference/sandboxes/create-sandbox), [Pause](https://docs.e2b.dev/api-reference/sandboxes/pause-sandbox) and [Connect](https://docs.e2b.dev/api-reference/sandboxes/connect-to-sandbox) references checked on 2026-09-07 document autoPauseMemory and memory selection, including Connect memory=false. Thus the field is not exclusively a Kuasar extension. Kuasar's nil→source-dependent auto behavior and its existing authorized-traffic Wake of both E and S are specific local semantics; upstream documents restrictions on traffic-triggered resume of filesystem-only snapshots. Kuasar does not claim the complete E2B autoResume policy.
@@ -1380,6 +1380,35 @@ Create/Connect/Wake/route activation/native exec/exec-session/migration import s
 After durable acceptance, finalizer waits for late launch ownership to finish, then stops/resets exact unit with inactive readback, detaches inside allocation fence, full-owner-CAS clears network tuple, removes RunDir and BaseDir and exactly hard-deletes. Only successful durable network clear releases the detached-port fence. Later directory/row failures retain path/runner ownership without blocking new Attach. Hard-delete publishes terminal Extension/object observation, without another route Delete. Failures retain unfinished ownership and retry in-process or after startup. Fresh Create's route-applied barrier precedes resource launch; failed acceptance cleans locally, then exactly creates owner-free dead history and withdraws route.
 
 CommitRunningPaused atomically stores state/source. RunID, port and RunDir clear individually only after successful Stop/Reset fencing, Detach, selective checkpoint cleanup and RemoveAll. RunDir CAS also clears its envd/CI UDS paths. Each failure retains remaining retry fields. Fully cleaned paused state retains only BaseDir/checkpoint and source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
+
+When `resource_listen` is enabled, the node uses the source-independent
+[effective-zone matrix](node-resource.md#42-rawzone-and-effective-zone).
+Green/yellow admit Create and ordinary Resume; red admits ordinary Resume;
+critical retains eligibility for current resource-paused recovery. Snapshot
+template Create is still Create. All paths classify the final resolved operation,
+and accepted starting work retains its asynchronous identity if the zone changes.
+
+Resource pressure invokes the existing full memory Pause, including native exec
+quiesce and cleanup. It records `resource-pressure`, the current recovery
+obligation, a version, and the continuous-running start time in the existing
+SQLite row. The single recovery worker and real Proxy Wake share launch
+singleflight. Actual running commit clears the obligation and resets the running
+interval; runner creation or snapshot opening does not. Cleanup ownership and
+resource Release remain separate facts.
+
+For an authenticated resource-paused sandbox, default memory Pause atomically
+adopts its retained source as ordinary explicit paused state after the Hook and
+its full-record CAS check. IDs/source/cleanup do not change, and there is no new
+capture or VM start. This cancels resource auto-recovery and unused holds, and
+publishes the changed reason even though state remains paused. Explicit capture
+options or filesystem-only Pause return 400 because compatibility with a new
+capture action cannot be certified. Ordinary repeated Pause and starting retain
+409. Adoption survives restart; later real Wake uses ordinary eligibility, while
+the legitimate saved snapshot retains its complete-budget recovery capability.
+It creates no permanent user-paused lock and cannot restore killed exec children
+or replay requests already delivered to the old VM. See
+[resource lifecycle](node-resource.md#64-resource-pause-recovery-and-explicit-adoption)
+for Q, critical exit, storage and accounting rules.
 
 ### 8.1 Artifact capture, templates and migration
 

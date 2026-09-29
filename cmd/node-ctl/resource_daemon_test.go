@@ -30,3 +30,17 @@ func TestResourceProbeSaturatesConservativeRecoveryCharge(t *testing.T) {
 		t.Fatalf("resource probe did not saturate safely: %+v", snapshot)
 	}
 }
+
+// Existing heartbeat/API production wiring must export the effective state,
+// even though no live reservation alone explains the outstanding obligation.
+func TestResourceProbeExportsEffectiveCriticalWithoutInventingReservation(t *testing.T) {
+	s := nodectl.NewState(1000, 1000, 0, 0, nodectl.Watermarks{LowFactor: .7, HighFactor: .85, EmergencyFactor: .05, StartupFactor: .5})
+	s.ObserveObligation("paused", 1, "paused", false)
+	p := conductorapp.NewResourceProbe(s, nodectl.NewAdmissionController(nodectl.AdmissionPolicy{})).Snapshot()
+	if p.Zone != "critical" || p.Allocated != 0 || p.Pool != 1000 {
+		t.Fatalf("node production snapshot=%+v", p)
+	}
+	if s.ResourceSnapshot().RawZone != nodectl.ZoneGreen {
+		t.Fatal("effective critical fabricated reservation pressure")
+	}
+}

@@ -30,6 +30,12 @@ func (o *Orchestrator) acceptSandboxDeleteLocked(ctx context.Context, sb *types.
 		return false, fmt.Errorf("orch: sandbox %s changed before delete acceptance", sb.ID)
 	}
 
+	deleting := cloneSandbox(sb)
+	deleting.State = types.StateDeleting
+	deleting.ResourceObligation = false
+	deleting.PauseReason = ""
+	deleting.PressureVersion++
+	o.observePressureSandbox(deleting)
 	o.launches.Cancel(sb.ID)
 	o.clearDeadlineIntent(sb.ID)
 	o.uncache(sb.ID)
@@ -375,6 +381,7 @@ func (o *Orchestrator) recordPausedCleanupProgress(sb *types.Sandbox, beforeRunI
 		return
 	}
 	o.cache(sb)
+	o.observePressureSandbox(sb)
 	if sb.RunID != beforeRunID || sb.VswitchPort != beforePort {
 		o.publishUpsert(sb)
 		o.observeSandboxUpsert(sb)

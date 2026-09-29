@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,11 +53,12 @@ type vsClient interface {
 }
 
 type Orchestrator struct {
-	cfg *config.Config
-	st  *store.Store
-	lc  launcher.Launcher
-	vs  vsClient
-	log *slog.Logger
+	memoryPressure atomic.Pointer[nodePressureController]
+	cfg            *config.Config
+	st             *store.Store
+	lc             launcher.Launcher
+	vs             vsClient
+	log            *slog.Logger
 	// executables is frozen process bootstrap state. It never enters the public
 	// declarative configuration or any serialized snapshot.
 	executables configresolve.Executables
@@ -319,6 +321,10 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	if err := lifecycleCtx.Err(); err != nil {
 		o.launches.Finish(attempt, err)
 		return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
+	}
+	if err := o.checkResourceLaunch(sb); err != nil {
+		o.launches.Finish(attempt, err)
+		return nil, nil, err
 	}
 	var routesDigest string
 	var secretValues store.MMDSRouteSecretValues
@@ -701,6 +707,10 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	// must never replace the authoritative cached record after acceptance.
 	running := o.mutateCached(sb.ID, func(cached *types.Sandbox) {
 		cached.State = types.StateRunning
+		cached.PauseReason, cached.ResourceObligation = "", false
+		cached.PressureVersion++
+		cached.RunningSinceUnixNano = time.Now().UnixNano()
+		cached.PressureSinceUnixNano = 0
 		cached.RunID = sb.RunID
 		cached.LaunchMode = ""
 	})
@@ -713,12 +723,20 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 			o.log.Error("reload committed sandbox failed", "sid", sb.ID, "run_id", sb.RunID, "err", err)
 			running = cloneSandbox(sb)
 			running.State = types.StateRunning
+			running.PauseReason, running.ResourceObligation = "", false
+			running.PressureVersion = sb.PressureVersion + 1
+			running.RunningSinceUnixNano = time.Now().UnixNano()
+			running.PressureSinceUnixNano = 0
 			running.LaunchMode = ""
 		}
 		if running == nil || running.State != types.StateRunning || running.RunID != sb.RunID {
 			o.log.Error("committed sandbox cache invariant failed", "sid", sb.ID, "run_id", sb.RunID)
 			running = cloneSandbox(sb)
 			running.State = types.StateRunning
+			running.PauseReason, running.ResourceObligation = "", false
+			running.PressureVersion = sb.PressureVersion + 1
+			running.RunningSinceUnixNano = time.Now().UnixNano()
+			running.PressureSinceUnixNano = 0
 			running.LaunchMode = ""
 		}
 		o.cache(running)
@@ -1209,7 +1227,7 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request san
 	case types.StateStarting:
 		return api.ErrSandboxStarting
 	case types.StatePaused:
-		return api.ErrAlreadyPaused
+		return o.adoptResourcePauseLocked(ctx, sb, request)
 	case types.StateRunning:
 	default:
 		return api.ErrNotFound
@@ -1242,14 +1260,16 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 		unlock()
 		return api.ErrSandboxStarting
 	case types.StatePaused:
-		unlock()
-		return api.ErrAlreadyPaused
+		if !sandbox.ResourceObligation || sandbox.PauseReason != types.PauseReasonResource {
+			unlock()
+			return api.ErrAlreadyPaused
+		}
 	case types.StateRunning:
 	default:
 		unlock()
 		return api.ErrNotFound
 	}
-	if request.Kind == types.CaptureSnapshot {
+	if sandbox.State != types.StatePaused && request.Kind == types.CaptureSnapshot {
 		if _, err := o.resolveSnapshotPolicy(sandbox.Metadata, request.SnapshotPolicy); err != nil {
 			unlock()
 			return err
@@ -1301,6 +1321,12 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	}
 	if err := validateCaptureRequest(finalRequest); err != nil {
 		return err
+	}
+	if current.State == types.StatePaused {
+		if request.Kind != types.CaptureSnapshot || !request.SnapshotPolicy.Empty() {
+			return fmt.Errorf("%w: explicit capture options require a new capture", api.ErrBadRequest)
+		}
+		return o.adoptResourcePauseLocked(ctx, current, finalRequest)
 	}
 	if finalRequest.Kind == types.CaptureSnapshot {
 		finalRequest.SnapshotPolicy, err = o.resolveSnapshotPolicy(current.Metadata, finalRequest.SnapshotPolicy)
@@ -1393,6 +1419,11 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	paused.ResumeSource = result.Source
 	paused.LaunchMode = ""
 	paused.State = types.StatePaused
+	paused.RunningSinceUnixNano = 0
+	paused.PressureVersion++
+	if !paused.ResourceObligation {
+		paused.PauseReason = types.PauseReasonExplicit
+	}
 
 	cleanupCtx, cancel := cleanupContext()
 	defer cancel()
@@ -1903,6 +1934,9 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 			envdUDS = filepath.Join(runDir, "envd.sock")
 			ciUDS = filepath.Join(runDir, "ci.sock")
 		}
+		if err := o.checkResourceLaunch(sb); err != nil {
+			return nil, nil, err
+		}
 		changed, err := o.st.BeginResume(ctx, sid, deadline, launchMode, runDir, envdUDS, ciUDS)
 		if err != nil {
 			return nil, nil, err
@@ -1912,6 +1946,7 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 		}
 		starting := cloneSandbox(sb)
 		starting.State = types.StateStarting
+		starting.PressureVersion++
 		starting.LaunchMode = launchMode
 		starting.DeadlineUnix = deadline
 		starting.RunDir = runDir

@@ -49,6 +49,10 @@ type SandboxClusterView struct {
 // sandbox. Maps and pointers are deep-copied for every Get and Watch callback.
 // Runtime fields are node-local and belong to the current incarnation.
 type SandboxView struct {
+	PauseReason            string
+	ResourceObligation     bool
+	PressureVersion        uint64
+	RunningSinceUnixNano   int64
 	ID                     string // current node-local sandbox ID
 	StableID               string // identity preserved across node-local ID changes
 	Profile                Profile

@@ -104,13 +104,17 @@ const (
 // A credential-authorized "paused" route may make the proxy send a Wake;
 // "starting" waits passively and "running" lets it forward.
 type RouteEntry struct {
-	SandboxID  string `json:"sid"`
-	Profile    string `json:"profile"`               // "e2b" | "bare"
-	TemplateID string `json:"template_id,omitempty"` // for MMDS envID (proxy-served metadata)
-	State      string `json:"state"`                 // "starting" | "running" | "paused" | "dead"
-	EnvdUDS    string `json:"envd_uds,omitempty"`    // e2b control port 49983
-	CiUDS      string `json:"ci_uds,omitempty"`      // e2b code-interpreter port 49999
-	FloatingIP string `json:"floatingip,omitempty"`  // host-reachable addr for user ports
+	PauseReason          string `json:"pause_reason,omitempty"`
+	ResourceObligation   bool   `json:"resource_obligation,omitempty"`
+	PressureVersion      uint64 `json:"pressure_version,omitempty"`
+	RunningSinceUnixNano int64  `json:"running_since_unix_nano,omitempty"`
+	SandboxID            string `json:"sid"`
+	Profile              string `json:"profile"`               // "e2b" | "bare"
+	TemplateID           string `json:"template_id,omitempty"` // for MMDS envID (proxy-served metadata)
+	State                string `json:"state"`                 // "starting" | "running" | "paused" | "dead"
+	EnvdUDS              string `json:"envd_uds,omitempty"`    // e2b control port 49983
+	CiUDS                string `json:"ci_uds,omitempty"`      // e2b code-interpreter port 49999
+	FloatingIP           string `json:"floatingip,omitempty"`  // host-reachable addr for user ports
 
 	// Credential material is copied from the sandbox business record. Trusted
 	// proxy/registry subscribers use the roots and fingerprints for local request

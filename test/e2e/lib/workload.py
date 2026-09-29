@@ -5,6 +5,7 @@
 #   pareto  — Pareto-distributed active durations + Poisson idle gaps
 #             (closer to real agent traffic; needs longer windows)
 #   idle    — boot, then sleep (for density baselines)
+#   hold    — dirty and retain memory; a state file proves warm restore identity
 #
 # Common env:
 #   WL_DURATION   total run time in seconds
@@ -29,6 +30,7 @@
 # (and faulted on the host UFFD) — anonymous pages would otherwise fault
 # in lazily without observable RSS.
 
+import json
 import math
 import os
 import random
@@ -149,6 +151,28 @@ def run_idle(duration):
     time.sleep(duration)
 
 
+def run_hold(duration, target_mib):
+    # The node receives no workload size or completion hint. This controlled
+    # primary guest process survives Snapshot; native exec sessions do not.
+    nonce = os.urandom(16).hex()
+    held = grow_to(target_mib * 1024 * 1024, time.time() + duration)
+    if len(held) < target_mib * 1024 * 1024:
+        raise RuntimeError("held-memory allocation did not complete")
+    state_file = env_str("WL_STATE_FILE", "/tmp/pressure-state.json")
+    tick = 0
+    end = time.time() + duration
+    while time.time() < end:
+        # Touch every page without discarding the allocation. Do not count
+        # process exit, an OOM, or an empty allocation as coordination success.
+        if any(held[index] != 255 for index in range(0, len(held), 4096)):
+            raise RuntimeError("held-memory contents changed")
+        tick += 1
+        with open(state_file + ".new", "w") as output:
+            json.dump(dict(nonce=nonce, held=len(held), tick=tick), output)
+        os.replace(state_file + ".new", state_file)
+        time.sleep(0.2)
+
+
 def main():
     wait_for_start_gate()
     seed = env_int("WL_SEED", 42)
@@ -167,6 +191,8 @@ def main():
         run_pareto(duration, rmin, rmax, lam, alpha, xmin)
     elif mode == "idle":
         run_idle(duration)
+    elif mode == "hold":
+        run_hold(duration, rmax)
     else:
         print(f"workload: unknown WL_MODE={mode}", file=sys.stderr, flush=True)
         sys.exit(2)

@@ -745,6 +745,8 @@ func clusterCommandRejection(err error) (int, string) {
 		return http.StatusConflict, api.ErrAlreadyExists.Error()
 	case errors.Is(err, conductorextension.ErrRejected):
 		return http.StatusForbidden, conductorextension.ErrRejected.Error()
+	case errors.Is(err, api.ErrResourceUnavailable):
+		return http.StatusServiceUnavailable, api.ErrResourceUnavailable.Error()
 	case errors.Is(err, api.ErrExtensionUnavailable):
 		return http.StatusServiceUnavailable, api.ErrExtensionUnavailable.Error()
 	case errors.Is(err, api.ErrSandboxChanged):

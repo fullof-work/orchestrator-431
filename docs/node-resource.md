@@ -2,7 +2,7 @@
 
 # node-resource — node reservation controller
 
-`node-ctl conductor serve` optionally embeds the node resource controller. It owns node-side reservation, admission, pools, watermarks, recovery inventory and statistics projection. Sandboxer owns the sandbox-local loop for guest memory observations, Cloud Hypervisor ballooning, `memory.high` and cold/restore/snapshot lifecycle; those operations do not belong to the node controller.
+`node-ctl conductor serve` optionally embeds the node resource controller. It owns node-side reservation, admission, pools, watermarks, recovery inventory, pressure episodes and statistics projection. The pressure worker coordinates the existing full memory Pause/Resume lifecycle through the orchestrator. Sandboxer owns the sandbox-local loop for guest memory observations, Cloud Hypervisor ballooning, `memory.high` and cold/restore/snapshot lifecycle; those operations do not belong to the node controller.
 
 ## 1. Overview
 
@@ -127,7 +127,7 @@ Sandbox-local state also includes `TargetBudget`, `CurrentBudget`, `ObservedBudg
 
 - `0 < NodeReservation <= Capacity`.
 - `reservedMemory = sum(live NodeReservation)`.
-- Admission, pools, zones, ResourceProbe, cluster projected load and recovery replacement aggregate NodeReservation only.
+- Pools, RawZone, ResourceProbe allocated memory and recovery replacement aggregate NodeReservation only. Effective Zone also records qualified pressure and outstanding recovery obligations.
 - Only the sandbox initiates growth; the node accounts for a grant before returning it.
 - Only the sandbox submits shrink, after balloon current converges and memory.high is handled in the required order.
 - `Settled` is a lifecycle fact; it does not derive or rewrite reservation from memory.current.
@@ -142,9 +142,16 @@ Conductor starts the controller through `resource_listen`; there is no standalon
 node-ctl resource status [--socket PATH]
 node-ctl resource list   [--socket PATH]
 node-ctl resource drain  [--socket PATH] [--disable]
+node-ctl resource pressure [--socket CONTROL_SOCKET]
 ```
 
 `status` shows node budget, host reserved, operational margin, allocatable pool, reserved memory, startup in-flight, zone and recovery counts. `list` shows each sandbox reservation. `drain` prevents new admission without altering live reservations.
+
+`pressure` queries `GET /internal/admin/resource-pressure` on the conductor control socket (or `NODE_CTL_SOCKET`), using the existing local admin authentication. It reports effective/RawZone, transition reason/version/time, R/P/E, hold remaining, protected funds, Q by phase, cleanup barriers, oldest wait, host safety pressure, per-sandbox pause reason/running interval, and a bounded recent operation history. The resource reservation protocol remains unchanged.
+
+`worker_blocked=no_eligible_running_sandbox` explains a pressure episode with
+no safe running candidate; the worker waits without releasing another owner's
+charge.
 
 There is no `resource grant` or `resource reclaim`. Headroom is a sandbox-policy input: select it through supported sandbox configuration/lifecycle inputs, and let the sandbox's existing loop converge from observations. This does not introduce a node command for live policy reload or direct balloon/cgroup adjustment.
 
@@ -202,11 +209,20 @@ resource_listen:
     startup_ttl: 30s
     queue_ttl: 30s
     queue_max_depth: 256
+  pressure:
+    interval: 1s
+    failure_interval: 500ms
+    critical_after_rounds: 3
+    pause_after_rounds: 3
+    critical_exit_hold: 5s
+    red_to_yellow_hold: 30s
+    yellow_to_green_hold: 30s
+    minimum_run_time: 30s
 ```
 
 `operational_margin_factor` reserves a node safety margin from the post-host budget. `emergency_factor` reserves pool capacity for high-urgency growth. `startup_factor` bounds aggregate reservations for concurrent creation/restoration. Admission rate/burst form a request token bucket, not memory Budget.
 
-Preflight requires `host_reserved.memory < physical_memory` and validates `0 <= operational_margin_factor < 1`, `0 <= low_factor < high_factor < 1`, `0 <= emergency_factor < startup_factor <= 1` and `0 < memory_grant_per_sec_factor <= 1`. Invalid values fail before pool calculation, unsigned subtraction or cluster-load projection.
+Preflight requires `host_reserved.memory < physical_memory` and validates `0 <= operational_margin_factor < 1`, `0 <= low_factor < high_factor < 1 - emergency_factor <= 1`, `0 <= emergency_factor < startup_factor <= 1` and `0 < memory_grant_per_sec_factor <= 1`. The final pool must be positive and byte-rounded thresholds must satisfy `Ty < Tr < Tc`. Pressure intervals and holds must be positive, failure rounds must be positive, failure interval must be at least 250ms, and minimum run time must be nonnegative. Invalid values fail before serving. These defaults are initial tuning values; validate capture/restore latency and net host release on the target node.
 
 `resource_listen.socket` is the sole endpoint configuration. Node-ctl binds an absolute path and canonicalizes parent-directory symlinks into the identity shared by owner lock, lease inventory and sandbox client. A symlink at the final socket, dangling path or ambiguous alias fails closed. Sandbox YAML does not carry `control.cgroup_path`; the runner injects that host capability through an inherited cgroup FD. `resource_listen.state_path` is deprecated and ignored; it does not enable state.json recovery (§8.1).
 
@@ -232,18 +248,48 @@ NodeBudget is the current status/wire name for configured or discovered physical
 
 Resource subtraction saturates instead of underflowing. Individual reservation and aggregate updates occur in the same State critical section. Insertion/recovery replacement validates aggregate-addition overflow before modifying indices.
 
-### 4.2 Zone
+### 4.2 RawZone and effective Zone
 
-Zone derives solely from Reserved / AllocatablePool:
+Let `R=Reserved`, `P=AllocatablePool`, `E=floor(P*emergency_factor)`,
+`Ty=floor(P*low_factor)`, `Tr=floor(P*high_factor)` and `Tc=P-E`.
+RawZone is green below Ty, yellow from Ty to below Tr, red from Tr to below
+Tc, and critical at or above Tc. Zero pool fails preflight and is critical
+if encountered defensively at runtime.
 
-| Zone | Meaning |
-|---|---|
-| green | Normal admission and growth. |
-| yellow | Conservative operation; policy can still grant. |
-| red | Reject new admission and defer non-high-urgency growth. |
-| critical | Retain only safety/high-urgency request paths. |
+Effective Zone is the single stateful node authority. Reservation threshold
+upgrades are immediate. Valid sustained memory failures may also upgrade
+straight from green/yellow/red to critical. Request origin has no role:
 
-Zone does not consume MemAvailable, balloon current, memory.current or sandbox lifecycle details.
+| Effective Zone | Create, including snapshot templates | Ordinary resume | Resource-paused recovery | Resource Pause |
+|---|---|---|---|---|
+| green | Eligible | Eligible | Eligible | No |
+| yellow | Eligible | Eligible | Eligible | No |
+| red | No | Eligible | Eligible | No |
+| critical | No | No | Eligible | After further qualified pressure |
+
+Eligibility still requires actual full initial memory, startup coordination,
+rate tokens, and the existing authentication/ownership checks. Direct API,
+Proxy, internal launch paths and node command execution use this same rule.
+Cluster placement preferences belong to #46; yellow is not a node-side
+cluster-create rejection mode. NodeList has no dynamic zone fields or aliases.
+
+A failure round is a time-progressed recheck of the same valid demand and
+launch/token identity. Concurrent duplicates, credential/shape errors,
+impossible capacity, drain, transport failures, and startup-slot/rate-token
+waits do not count. Three qualified rounds enter critical; three further
+rounds authorize one Pause. Another Pause needs fresh rounds. Reservation
+increments smaller than sandboxer's executable MemoryStep do not erase a
+still-blocked demand. A host MemAvailable sample below OperationalMargin is
+a separate safety input; it neither changes R nor grants the reserved margin.
+
+Q includes accepted capture intent, resource-pressure paused rows and their
+starting resumes. Q>0 keeps critical even when RawZone is green. Exit requires
+Q=0, no related unverified cleanup, RawZone below critical, and no active
+qualified memory blockage throughout the exit hold. It exits only to red.
+Red requires RawZone below red continuously for its own hold before yellow;
+yellow requires continuously green RawZone for its hold before green. Rebound
+resets the hold. One evaluation performs at most one downgrade. Restart loads
+the journal and obligations before admission and restarts monotonic hold clocks.
 
 ### 4.3 Runtime grants
 
@@ -256,6 +302,8 @@ response: GrantedDelta, NewReservation, Cooldown
 NewReservation = CurrentReservation + GrantedDelta
 0 <= GrantedDelta <= RequestedDelta
 ```
+
+Normal new growth uses actual `P-R-E`, less another selected waiter's unused protection; high urgency can use E but cannot exceed P. Effective red/critical does not itself deny runtime growth. Already-charged replay is reused without another charge or rate debit. One selected resume/grow demand protects released headroom until admission, executable progress, cancellation or expiration of an unused hold. Resume protection has priority over grow; a protection never subtracts a live reservation on cancellation.
 
 Partial grants are allowed. Sandboxer accumulates reservation first and deflates the balloon only when it can represent a 64 MiB-aligned Budget, so rounding cannot create unreserved memory.
 
@@ -345,19 +393,89 @@ sandbox RequestBudget(smaller baseline, delta=0) -> node release
 
 Node and sandbox do not share a state machine. Reservation requests/responses are their sole coordination boundary.
 
+### 6.4 Resource Pause, recovery and explicit adoption
+
+One capture worker selects the longest current continuous-running interval,
+not CreatedUnix. Running commit resets that interval. It uses the existing
+memory Pause: native exec quiesce/cleanup, Snapshot capture, old VM exit and
+runner/network/resource cleanup. It adds no retained-VMM pause, page swapper,
+exec preservation or new snapshot format. Checkpoint storage must be disk
+backed; tmpfs/ramfs is rejected. Only observed Release/reconciliation makes
+memory reusable. Capture failure backs off without discarding a saved source.
+
+One background recovery worker services the oldest outstanding obligation,
+using the common SID launch group also used by external Wake. Preparation
+starts after stable observed headroom; sandboxer subsequently supplies exact I
+and the final resource admission waits for its complete budget before VM start.
+Starting remains in Q until actual running commit. The minimum running window
+limits immediate re-eviction, with an override for observed host safety pressure.
+A valid demand can coordinate further Pause while effective Zone stays critical;
+recovery never waits for a downgrade that Q itself prevents. Missing/corrupt
+artifacts, full/slow storage and capacity failures retain the obligation/source
+and appear in operation diagnostics. Existing deadline termination and explicit
+Delete cancel recovery intent through the same lifecycle owner.
+
+An authenticated default memory Pause of an already resource-paused sandbox
+adopts its existing Snapshot as ordinary explicit paused state. The Hook runs
+and its full-record precondition is rechecked after lock reacquisition. One
+narrow durable CAS changes reason/obligation/version, preserving IDs, source,
+credentials and remaining cleanup. It neither captures again nor starts a VM.
+It cancels unused resource-recovery holds and the critical exemption exactly
+once, then publishes even though state is still paused. Explicit capture options
+(including explicit false values) or filesystem-only capture are rejected:
+the retained source cannot certify a new capture action. Hooks cannot silently
+remove such an action to turn it into adoption. Ordinary repeated Pause still
+returns 409; starting still conflicts. A later real Wake follows ordinary
+resume rules, with no permanent user-paused lock. Adoption is not Release and
+cannot bypass the critical exit conditions.
+
+Sandbox fields and the small transition journal share the existing SQLite
+owner. The node restores them with resource inventory before serving. Resource
+hot paths perform no capture, filesystem/network I/O or SQLite calls under
+State.mu. The admission queue precedes State; lifecycle callbacks never run
+under State. Low-frequency lifecycle/zone commits persist; grants/heartbeats
+do not rewrite whole durable state. Local routesync, SHM and extension
+projections carry reason, obligation, version and running interval as facts.
+
 ## 7. Admission and scheduling projection
 
 ### 7.1 Admission
 
-Cold uses StartupBudgetMemory; restore uses AllocatableAtSnapshot. The selected InitialBudget must satisfy all of the following:
+Cold starts use StartupBudgetMemory; memory restore uses the unchanged
+AllocatableAtSnapshot wire field, whose value is sandboxer's authoritative
+BudgetAtSnapshot. No RSS, compressed length, guest peak, or expected task
+completion substitutes for that value. Initial memory is always admitted in
+full under the same State mutex as aggregate mutation and runtime grants.
 
-- It does not exceed sandbox Capacity.
-- It fits the per-request limits of AllocatablePool and startup pool.
-- Current main headroom and startup headroom suffice.
-- Node is not drained and zone is not red/critical.
-- An admission token is available.
+The orchestrator assigns operation class from the final durable source and
+resolved launch mode. Its in-process launch lookup verifies the resource
+connection's peer PID against the current runner pidfile and its live POSIX
+lock on the same open file. RPC fields,
+metadata, template kind, urgency and Origin cannot grant recovery authority.
+A fresh snapshot-template create remains Create. A durable starting operation
+retains its accepted identity and asynchronous lifecycle if Zone changes; a
+later resource wait is not reported as a no-effect rejection of that operation.
 
-Temporary shortages can enter the FIFO queue. Requests beyond node limits, or disallowed by node-protection conditions, are rejected. No path proceeds with a smaller initial grant for startup/restore.
+Ordinary creates require `I <= StartupPool`, sufficient `P-R-E`, available
+startup budget and a rate token. Legitimate memory resumes retain a serialized
+complete-budget lane: no other startup may be in flight, the actual I is
+charged without truncation, and no concurrent startup enters until Settled
+or confirmed Release. This permits `I > StartupPool` and, when necessary,
+`I > P-E`, provided `R+I <= P` after other protections. Host/operational margin
+is outside P and is never granted. The capability belongs to a validated saved
+source and survives explicit Pause adoption; the critical exemption belongs
+only to the current resource memory-recovery obligation. An explicit cold
+resume follows ordinary resume policy and receives no saved-memory budget
+exception. `I>P` remains an explicit
+capacity failure with the saved source retained.
+
+The bounded admission queue revisits all entries in FIFO age order rather
+than stopping behind a newly ineligible create or a memory-blocked head.
+Every recheck resolves the current launch identity. Timeout or stale work can
+cancel only that identity's unused protection. Startup/rate waits preserve
+resume protection without accumulating memory-failure rounds. Replay and
+StateSync replace the existing charge atomically; disconnect, TTL or ambiguous
+cleanup cannot turn a charged consumer into free memory.
 
 ### 7.2 ResourceProbe and cluster load
 
@@ -401,7 +519,7 @@ Startup TTL cleans failed creations that never reached Settled. Heartbeat timeou
 
 The admission token bucket bounds creation bursts; startup pool bounds memory reserved for creating/restoring sandboxes; the runtime-grant token bucket bounds aggregate normal growth rate. High urgency can use emergency pool. The allocator may return cooldown, with retries driven by later sandbox observations/pressure events.
 
-Observe reservation/recovery state with resource status/list and cluster heartbeats. Abnormal queue diagnostics use conductor's standard logs, collected and retained by the deployment. Key measures are:
+Observe reservation/recovery state with resource status/list, the local `resource pressure` query, and existing node status production. ResourceProbe returns effective Zone and the same reservation R/P; consumers must not reconstruct effective Zone from R/P. Abnormal queue diagnostics use conductor's standard logs, collected and retained by the deployment. Key measures are:
 
 - Reserved memory / pool / zone.
 - Startup in-flight.

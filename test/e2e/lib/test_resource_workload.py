@@ -1,4 +1,5 @@
 """Run the prepared guest pressure fixture and its host-controlled barriers."""
+import json
 import os
 from pathlib import Path
 import queue
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 
@@ -126,6 +128,33 @@ resource_write_pressure_workload fixture "$3" "$WORK/start" "$WORK/delivery"
                 process.wait(timeout=3)
             reader.join(timeout=3)
             process.stdout.close()
+
+    def test_hold_workload_keeps_memory_and_primary_identity(self):
+        state = self.work / "held.json"
+        env = {**os.environ, "WL_MODE": "hold", "WL_DURATION": "10",
+               "WL_RMAX_MIB": "8", "WL_STATE_FILE": str(state), "WL_START_GATE": ""}
+        process = subprocess.Popen([sys.executable, str(WORKLOAD)], env=env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            first = None
+            while time.monotonic() < deadline:
+                self.assertIsNone(process.poll(), "primary workload exited")
+                if state.exists():
+                    current = json.loads(state.read_text())
+                    self.assertEqual(current["held"], 8 << 20)
+                    if first is None:
+                        first = current
+                    elif current["tick"] > first["tick"]:
+                        self.assertEqual(current["nonce"], first["nonce"])
+                        break
+                time.sleep(.02)
+            else:
+                self.fail("retained memory did not continue making progress")
+        finally:
+            process.terminate()
+            process.communicate(timeout=3)
+
 
     def test_guest_start_gate_has_a_real_failure_deadline(self):
         _, launch = self.launch("dynamic")

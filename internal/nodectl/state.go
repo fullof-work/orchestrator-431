@@ -10,6 +10,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
 const (
@@ -153,6 +155,8 @@ type State struct {
 	startupInFlight  uint64
 	provisionalCount int
 	unknownCount     int
+	pressure         pressureState
+	pressureWake     chan struct{}
 
 	NodeBudget        Resources
 	HostReserved      Resources
@@ -192,7 +196,9 @@ func (s *State) startupPoolBytesLocked() uint64 {
 }
 
 func (s *State) memoryZoneLocked() Zone {
-	return s.memoryZoneForReservedLocked(s.reservedMemory)
+	s.initPressureLocked()
+	s.advancePressureLocked(s.pressure.clock())
+	return s.pressure.record.Zone
 }
 
 func (s *State) memoryZoneForReservedLocked(reserved uint64) Zone {
@@ -251,6 +257,7 @@ type ResourceSnapshot struct {
 	ProvisionalCount  int
 	UnknownCount      int
 	Zone              Zone
+	RawZone           Zone
 }
 
 func (s *State) ResourceSnapshot() ResourceSnapshot {
@@ -266,7 +273,7 @@ func (s *State) resourceSnapshotLocked() ResourceSnapshot {
 		Reserved:        Resources{MemoryBytes: s.reservedMemory, CPUMilli: s.allocatedCPU},
 		StartupInFlight: s.startupInFlight, ReservationCount: len(s.bySID),
 		ProvisionalCount: s.provisionalCount, UnknownCount: s.unknownCount,
-		Zone: s.memoryZoneLocked(),
+		Zone: s.memoryZoneLocked(), RawZone: s.memoryZoneForReservedLocked(s.reservedMemory),
 	}
 }
 
@@ -290,6 +297,15 @@ func (s *State) addAggregatesLocked(r *Reservation) error {
 	if r.RecoverySource == RecoveryUnknownLease || r.RecoverySource == RecoveryUnknownManaged {
 		s.unknownCount++
 	}
+	s.initPressureLocked()
+	if ob, found := s.pressure.obligations[r.SandboxID]; found && ob.accountCharge && !ob.cleanup {
+		ob.cleanup = true
+		s.pressure.cleanup++
+		s.pressure.obligations[r.SandboxID] = ob
+	}
+	s.memoryZoneLocked()
+	s.pressure.lastReservationChange = s.pressure.clock()
+	s.signalPressureLocked()
 	return nil
 }
 
@@ -416,6 +432,8 @@ func (s *State) removeAggregatesLocked(r *Reservation) error {
 	if unknown {
 		s.unknownCount--
 	}
+	s.initPressureLocked()
+	s.pressure.lastReservationChange = s.pressure.clock()
 	return nil
 }
 
@@ -426,6 +444,11 @@ func cloneReservation(r *Reservation) Reservation {
 }
 
 func (s *State) deleteLocked(sid string) (*Reservation, error) {
+	return s.detachLocked(sid, true)
+}
+
+// Replacement removes an index entry without claiming physical release.
+func (s *State) detachLocked(sid string, released bool) (*Reservation, error) {
 	r := s.bySID[sid]
 	if r == nil {
 		return nil, nil
@@ -434,6 +457,21 @@ func (s *State) deleteLocked(sid string) (*Reservation, error) {
 		return nil, err
 	}
 	delete(s.bySID, sid)
+	s.initPressureLocked()
+	if ob, ok := s.pressure.obligations[sid]; released && ok && ob.cleanup && !ob.cleanupOwner {
+		ob.cleanup = false
+		if ob.retired {
+			delete(s.pressure.obligations, sid)
+		} else {
+			s.pressure.obligations[sid] = ob
+		}
+		s.pressure.cleanup--
+	}
+	s.clearDemandLocked("grow:" + sid)
+	if released && s.pressure.exclusive == sid {
+		s.pressure.exclusive = ""
+	}
+	s.signalPressureLocked()
 	if r.Token != "" && s.tokenToSID[r.Token] == sid {
 		delete(s.tokenToSID, r.Token)
 	}
@@ -549,6 +587,7 @@ func (s *State) HasCgroup(path string) bool {
 }
 
 type AdmitSpec struct {
+	Admission             *LaunchAdmission // authenticated in-process launch; nil for inventory/tests
 	SandboxID             string
 	PeerPID               int
 	CgroupPath            string
@@ -610,7 +649,14 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	wasExclusive := s.pressure.exclusive == spec.SandboxID
 	var oldConn net.Conn
+	if s.bySID[spec.SandboxID] == nil && spec.Admission != nil {
+		oc := s.admissionBudgetLocked(spec.SandboxID, spec.InitialBudget, *spec.Admission)
+		if oc.Status != OutcomeAdmitted {
+			return Reservation{}, nil, &AdmissionWaitError{Outcome: oc}
+		}
+	}
 	if existing := s.bySID[spec.SandboxID]; existing != nil {
 		if existing.Provisional {
 			if spec.InitialBudget > existing.ReservationMemory {
@@ -662,18 +708,22 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 		return Reservation{}, oldConn, err
 	}
 	if s.bySID[spec.SandboxID] != nil {
-		if _, err := s.deleteLocked(spec.SandboxID); err != nil {
+		if _, err := s.detachLocked(spec.SandboxID, false); err != nil {
 			return Reservation{}, oldConn, err
 		}
 	}
 	if otherSID != "" && otherSID != spec.SandboxID {
-		if _, err := s.deleteLocked(otherSID); err != nil {
+		if _, err := s.detachLocked(otherSID, false); err != nil {
 			return Reservation{}, oldConn, err
 		}
 	}
 	if err := s.insertLocked(r); err != nil {
 		return Reservation{}, oldConn, err
 	}
+	if wasExclusive || (spec.Admission != nil && spec.Admission.SavedSource) {
+		s.pressure.exclusive = spec.SandboxID
+	}
+	s.clearDemandLocked("admit:" + spec.SandboxID)
 	return cloneReservation(r), oldConn, nil
 }
 
@@ -723,6 +773,7 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	wasExclusive := s.pressure.exclusive == spec.SandboxID
 	var oldConns []net.Conn
 	existing := s.bySID[spec.SandboxID]
 	if existing != nil {
@@ -784,17 +835,24 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 		return Reservation{}, oldConns, err
 	}
 	if s.bySID[spec.SandboxID] != nil {
-		if _, err := s.deleteLocked(spec.SandboxID); err != nil {
+		if _, err := s.detachLocked(spec.SandboxID, false); err != nil {
 			return Reservation{}, oldConns, err
 		}
 	}
 	if otherSID != "" && otherSID != spec.SandboxID {
-		if _, err := s.deleteLocked(otherSID); err != nil {
+		if _, err := s.detachLocked(otherSID, false); err != nil {
 			return Reservation{}, oldConns, err
 		}
 	}
 	if err := s.insertLocked(r); err != nil {
 		return Reservation{}, oldConns, err
+	}
+	if wasExclusive {
+		if spec.Settled {
+			s.pressure.exclusive = ""
+		} else {
+			s.pressure.exclusive = spec.SandboxID
+		}
 	}
 	return cloneReservation(r), oldConns, nil
 }
@@ -836,6 +894,10 @@ func (s *State) SetSettled(token string, hostMemoryCurrent uint64, now time.Time
 		_ = s.addAggregatesLocked(r)
 		return Reservation{}, true, err
 	}
+	if s.pressure.exclusive == r.SandboxID {
+		s.pressure.exclusive = ""
+	}
+	s.signalPressureLocked()
 	return cloneReservation(r), true, nil
 }
 
@@ -887,17 +949,11 @@ func (s *State) ReconcileAndGrant(token string, current, requested uint64, urgen
 	if err := s.validateAggregateReplacementLocked([]*Reservation{r}, &baseView); err != nil {
 		return GrantResult{}, true, err
 	}
-	zone := s.memoryZoneForReservedLocked(baseReserved)
+	zone := s.memoryZoneLocked()
 	decision := GrantDecision{GrantedDelta: reused}
 	remaining := requested - reused
 	if remaining == 0 {
-		if err := s.replaceReservationMemoryLocked(r, baseReservation); err != nil {
-			return GrantResult{}, true, err
-		}
-		return GrantResult{Reservation: cloneReservation(r), Decision: decision, Zone: zone}, true, nil
-	}
-	if (zone == ZoneRed || zone == ZoneCritical) && urgency != UrgencyHigh {
-		decision.CooldownMs = 500
+		s.clearDemandLocked("grow:" + r.SandboxID)
 		if err := s.replaceReservationMemoryLocked(r, baseReservation); err != nil {
 			return GrantResult{}, true, err
 		}
@@ -920,9 +976,14 @@ func (s *State) ReconcileAndGrant(token string, current, requested uint64, urgen
 	if r.Capacity.MemoryBytes > baseReservation {
 		capRoom = r.Capacity.MemoryBytes - baseReservation
 	}
-	if headroom > capRoom {
-		headroom = capRoom
+	key := "grow:" + r.SandboxID
+	protected := s.protectedLocked(key)
+	if protected >= headroom {
+		headroom = 0
+	} else {
+		headroom -= protected
 	}
+	headroom = min(headroom, capRoom)
 	newGrant := allocator.Grant(token, remaining, headroom, urgency)
 	decision.CooldownMs = newGrant.CooldownMs
 	finalReservation := baseReservation
@@ -943,6 +1004,22 @@ func (s *State) ReconcileAndGrant(token string, current, requested uint64, urgen
 	if err := s.replaceReservationMemoryLocked(r, finalReservation); err != nil {
 		return GrantResult{}, true, err
 	}
+	// Progress means a Budget that the sandboxer can execute, not a small
+	// positive reservation grant or an unrelated successful RPC. Keep its
+	// canonical step; no guest memory measurement enters node accounting.
+	minimum := min(remaining, resource.MemoryStep-baseReservation%resource.MemoryStep)
+	if allocator.policy.MinGrantStep > 0 {
+		minimum = max(minimum, min(remaining, allocator.policy.MinGrantStep))
+	}
+	executableBefore := current / resource.MemoryStep
+	executableAfter := finalReservation / resource.MemoryStep
+	if remaining <= capRoom && current <= pool && remaining <= pool-current && headroom < minimum && executableAfter == executableBefore && decision.GrantedDelta < requested {
+		protect := min(remaining, resource.MemoryStep-finalReservation%resource.MemoryStep)
+		s.failDemandLocked(key, r.SandboxID, r.Token, protect, executableAfter, false, s.pressure.clock())
+	} else if decision.GrantedDelta == requested || executableAfter > executableBefore || headroom >= minimum {
+		s.clearDemandLocked(key)
+	}
+	zone = s.memoryZoneLocked()
 	return GrantResult{Reservation: cloneReservation(r), Decision: decision, Zone: zone}, true, nil
 }
 

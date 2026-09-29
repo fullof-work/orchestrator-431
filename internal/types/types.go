@@ -357,37 +357,46 @@ type SandboxExecutionResult struct {
 }
 
 // Sandbox is one managed sandbox instance.
+const PauseReasonResource = "resource-pressure"
+const PauseReasonExplicit = "explicit"
+
+// Sandbox pressure fields are node-owned lifecycle state, never user metadata.
 type Sandbox struct {
-	ID                 string
-	Profile            Profile
-	Cluster            *ClusterSandboxContext
-	StableIDValue      string // optional stable identity; empty falls back to ID
-	TemplateID         string
-	State              State
-	DeadlineUnix       int64 // 0 = no deadline
-	RunDir             string
-	BaseDir            string
-	RunID              string // current systemd runner instance id
-	EnvdUDS            string // empty for bare
-	CiUDS              string // empty for bare
-	FloatingIP         string
-	VswitchPort        string // vswitch port handle (1-based; slot is vswitch-internal)
-	InnerIP            string // guest inner IP (CIDR), passed to vswitch attach + Network.IP
-	PortMAC            string // per-port MAC from attach -> Network.MAC
-	APISecret          string // per-tenant API authentication root (hex); never written to env/yaml
-	ManifestKey        string // per-tenant manifest encryption root (hex); never written to env/yaml
-	ResumeSource       ResumeSource
-	AutoPauseMemory    bool
-	LaunchMode         LaunchMode
-	ServiceSecret      string // per-sandbox service authentication root (hex); never exposed publicly
-	EnvdAccessToken    string
-	TrafficAccessToken string
-	ForwardAccessToken string
-	Metadata           map[string]string
-	Env                map[string]string
-	CreatedUnix        int64
-	DeadUnix           int64 // diagnostic dead commit time; 0 for every non-dead state
-	ExecutionResult    *SandboxExecutionResult
+	PauseReason           string
+	ResourceObligation    bool
+	PressureVersion       uint64
+	RunningSinceUnixNano  int64
+	PressureSinceUnixNano int64
+	ID                    string
+	Profile               Profile
+	Cluster               *ClusterSandboxContext
+	StableIDValue         string // optional stable identity; empty falls back to ID
+	TemplateID            string
+	State                 State
+	DeadlineUnix          int64 // 0 = no deadline
+	RunDir                string
+	BaseDir               string
+	RunID                 string // current systemd runner instance id
+	EnvdUDS               string // empty for bare
+	CiUDS                 string // empty for bare
+	FloatingIP            string
+	VswitchPort           string // vswitch port handle (1-based; slot is vswitch-internal)
+	InnerIP               string // guest inner IP (CIDR), passed to vswitch attach + Network.IP
+	PortMAC               string // per-port MAC from attach -> Network.MAC
+	APISecret             string // per-tenant API authentication root (hex); never written to env/yaml
+	ManifestKey           string // per-tenant manifest encryption root (hex); never written to env/yaml
+	ResumeSource          ResumeSource
+	AutoPauseMemory       bool
+	LaunchMode            LaunchMode
+	ServiceSecret         string // per-sandbox service authentication root (hex); never exposed publicly
+	EnvdAccessToken       string
+	TrafficAccessToken    string
+	ForwardAccessToken    string
+	Metadata              map[string]string
+	Env                   map[string]string
+	CreatedUnix           int64
+	DeadUnix              int64 // diagnostic dead commit time; 0 for every non-dead state
+	ExecutionResult       *SandboxExecutionResult
 }
 
 // ClusterSandboxContext is trusted node-local ownership state supplied by the

@@ -147,6 +147,7 @@ func cloneMap[K comparable, V any](in map[K]V) map[K]V {
 // sandboxes use static cgroup. The controller's tuning is inlined here — there is
 // no second config file; nodectl.Resolve consumes this struct directly.
 type ResourceListenConfig struct {
+	Pressure        ResourcePressureConfig   `yaml:"pressure" json:"pressure"`
 	Enabled         bool                     `yaml:"enabled" json:"enabled"`
 	Socket          string                   `yaml:"socket" json:"socket"`                       // controller UDS; "" = pkg/resource.DefaultSocket (sandbox-ctl's default)
 	StatePath       string                   `yaml:"state_path" json:"state_path"`               // deprecated and ignored; retained only so older YAML still parses
@@ -156,6 +157,19 @@ type ResourceListenConfig struct {
 	RateLimits      ResourceRateLimitsConfig `yaml:"rate_limits" json:"rate_limits"`             // memory grant rate limit
 	Admission       ResourceAdmissionConfig  `yaml:"admission" json:"admission"`                 // admit token bucket + queue
 	LogLevel        string                   `yaml:"log_level" json:"log_level"`                 // info (default)
+}
+
+// ResourcePressureConfig owns node pressure timing. No request-origin policy
+// exists; every local launch uses the same operation rules.
+type ResourcePressureConfig struct {
+	Interval            string `yaml:"interval" json:"interval"`
+	FailureInterval     string `yaml:"failure_interval" json:"failure_interval"`
+	CriticalAfterRounds int    `yaml:"critical_after_rounds" json:"critical_after_rounds"`
+	PauseAfterRounds    int    `yaml:"pause_after_rounds" json:"pause_after_rounds"`
+	CriticalExitHold    string `yaml:"critical_exit_hold" json:"critical_exit_hold"`
+	RedToYellowHold     string `yaml:"red_to_yellow_hold" json:"red_to_yellow_hold"`
+	YellowToGreenHold   string `yaml:"yellow_to_green_hold" json:"yellow_to_green_hold"`
+	MinimumRunTime      string `yaml:"minimum_run_time" json:"minimum_run_time"`
 }
 
 // ResourceHostConfig is the node's physical capacity and the host's own reservation.
@@ -200,6 +214,31 @@ type ResourceAdmissionConfig struct {
 // owns that protocol constant. Exported so nodectl.Resolve can default a config
 // block built outside config.Load (e.g. in tests).
 func (r *ResourceListenConfig) ApplyDefaults() {
+	if r.Pressure.Interval == "" {
+		r.Pressure.Interval = "1s"
+	}
+	if r.Pressure.FailureInterval == "" {
+		r.Pressure.FailureInterval = "500ms"
+	}
+	if r.Pressure.CriticalAfterRounds == 0 {
+		r.Pressure.CriticalAfterRounds = 3
+	}
+	if r.Pressure.PauseAfterRounds == 0 {
+		r.Pressure.PauseAfterRounds = 3
+	}
+	if r.Pressure.CriticalExitHold == "" {
+		r.Pressure.CriticalExitHold = "5s"
+	}
+	if r.Pressure.RedToYellowHold == "" {
+		r.Pressure.RedToYellowHold = "30s"
+	}
+	if r.Pressure.YellowToGreenHold == "" {
+		r.Pressure.YellowToGreenHold = "30s"
+	}
+	if r.Pressure.MinimumRunTime == "" {
+		r.Pressure.MinimumRunTime = "30s"
+	}
+
 	if len(r.CgroupScanPaths) == 0 {
 		r.CgroupScanPaths = []string{
 			"/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice",

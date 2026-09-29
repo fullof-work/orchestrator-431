@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -68,6 +69,7 @@ type PendingAdmit struct {
 	req       *Message // the full Admit request
 	conn      net.Conn
 	peerPID   int
+	identity  string // exact launch at enqueue; stale entries cannot borrow a successor
 	queuedAt  time.Time
 	queuedPos int // queue depth at insertion (informational, for metadata)
 
@@ -92,7 +94,8 @@ func (p *PendingAdmit) cancel() {
 // server-side FIFO queue + worker. When both are involved, queueMu precedes a
 // State method; State never calls back into AdmissionController.
 type AdmissionController struct {
-	policy AdmissionPolicy
+	policy       AdmissionPolicy
+	LookupLaunch func(string, int) (LaunchAdmission, error)
 
 	// Token bucket — only mutated under tokenMu.
 	tokenMu    sync.Mutex
@@ -220,6 +223,7 @@ func (a *AdmissionController) processQueueLocked() []admissionDiagnostic {
 		select {
 		case <-p.cancelCh:
 			a.queue.Remove(e)
+			a.state.ForgetAdmissionWait(p.req.SandboxID, p.identity)
 			// reply with Rejected only if conn still alive — write may fail
 			// on EOF case; ignore.
 			_ = WriteMessage(p.conn, &Message{
@@ -234,10 +238,13 @@ func (a *AdmissionController) processQueueLocked() []admissionDiagnostic {
 		e = next
 	}
 
-	// 2. FIFO admit head
-	for a.queue.Len() > 0 {
+	// Each pass examines the bounded queue once. A blocked create must not
+	// hide an eligible resume, and a protected recovery must reach Admit.
+	remaining := a.queue.Len()
+	for a.queue.Len() > 0 && remaining > 0 {
+		remaining--
 		head := a.queue.Front().Value.(*PendingAdmit)
-		oc := a.analyzeRequest(head.req)
+		oc := a.analyzePending(head)
 		switch oc.Status {
 		case OutcomeAdmitted:
 			// Consume token before committing the admit. If another admit
@@ -251,6 +258,13 @@ func (a *AdmissionController) processQueueLocked() []admissionDiagnostic {
 			head.ttlTimer.Stop()
 			resp, err := a.processFn(head)
 			if err != nil {
+				var wait *AdmissionWaitError
+				if errors.As(err, &wait) && wait.Outcome.Status == OutcomeShortTermBlock {
+					a.queue.PushBack(head)
+					head.ttlTimer.Reset(max(time.Millisecond, a.policy.QueueTTL-time.Since(head.queuedAt)))
+					continue
+				}
+				a.state.ForgetAdmissionWait(head.req.SandboxID, head.identity)
 				_ = WriteMessage(head.conn, &Message{
 					Type: TypeAdmitResponse, Status: StatusRejected, Msg: err.Error(),
 				})
@@ -298,6 +312,7 @@ func (a *AdmissionController) processQueueLocked() []admissionDiagnostic {
 			continue
 
 		case OutcomeLongTermReject:
+			a.state.ForgetAdmissionWait(head.req.SandboxID, head.identity)
 			a.queue.Remove(a.queue.Front())
 			head.ttlTimer.Stop()
 			_ = WriteMessage(head.conn, &Message{
@@ -321,13 +336,15 @@ func (a *AdmissionController) processQueueLocked() []admissionDiagnostic {
 			continue
 
 		case OutcomeShortTermBlock:
-			// Head still blocked. Stop here — strict FIFO.
 			if oc.Block == BlockedByTokenBucket {
 				a.resetTokenTimer()
+				return diagnostics
 			}
-			return diagnostics
+			a.queue.MoveToBack(a.queue.Front())
+			continue
 
 		case OutcomePreCheckReject:
+			a.state.ForgetAdmissionWait(head.req.SandboxID, head.identity)
 			// Should never reach the queue (pre-check happens at admit
 			// entry). Defensive: drop with the reject reason.
 			a.queue.Remove(a.queue.Front())
@@ -383,6 +400,7 @@ func (a *AdmissionController) drainQueueOnStop() {
 	for e := a.queue.Front(); e != nil; e = e.Next() {
 		p := e.Value.(*PendingAdmit)
 		p.ttlTimer.Stop()
+		a.state.ForgetAdmissionWait(p.req.SandboxID, p.identity)
 		_ = WriteMessage(p.conn, &Message{
 			Type:   TypeAdmitResponse,
 			Status: StatusRejected,
@@ -436,6 +454,32 @@ func (a *AdmissionController) AnalyzeRequest(req *Message) Outcome {
 }
 
 func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
+	return a.analyzeLaunch(req, LaunchAdmission{})
+}
+
+func (a *AdmissionController) resolveLaunch(sid string, pid int) (LaunchAdmission, error) {
+	if a.LookupLaunch == nil {
+		return LaunchAdmission{}, nil
+	}
+	return a.LookupLaunch(sid, pid)
+}
+
+func (a *AdmissionController) analyzePending(p *PendingAdmit) Outcome {
+	launch, err := a.resolveLaunch(p.req.SandboxID, p.peerPID)
+	if err != nil {
+		return Outcome{Status: OutcomeLongTermReject, RejectCode: "launch_identity", RejectMsg: err.Error()}
+	}
+	if launch.Identity != p.identity {
+		return Outcome{Status: OutcomeLongTermReject, RejectCode: "launch_identity", RejectMsg: "queued launch identity changed"}
+	}
+	oc := a.analyzeLaunch(p.req, launch)
+	if oc.Status == OutcomeShortTermBlock {
+		a.state.RecordAdmissionWait(p.req.SandboxID, launch, initialReservationBudget(p.req))
+	}
+	return oc
+}
+
+func (a *AdmissionController) analyzeLaunch(req *Message, launch LaunchAdmission) Outcome {
 	// 1. drain
 	a.drainMu.Lock()
 	drained := a.drained
@@ -458,6 +502,10 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 		}
 	}
 
+	if launch.SavedSource && req.AllocatableAtSnapshot == 0 {
+		return Outcome{Status: OutcomePreCheckReject, RejectCode: "invalid_snapshot_budget", RejectMsg: "saved-source launch requires BudgetAtSnapshot"}
+	}
+
 	// 2. Select the exact initial reservation. Cold start uses the already
 	// aligned StartupBudgetMemory. Restore uses AllocatableAtSnapshot, whose
 	// wire name is retained but whose value is BudgetAtSnapshot. Memory
@@ -472,60 +520,9 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 		}
 	}
 
-	snapshot := a.state.AdmissionSnapshot()
-	pool := snapshot.Pool.MemoryBytes
-	startupPool := snapshot.StartupPool
-	emerg := snapshot.EmergencyMemory
-	mainReserved := snapshot.Reserved.MemoryBytes
-	startupInFlight := snapshot.StartupInFlight
-	zone := snapshot.Zone
-
-	// 3. pre-check absolute capacity
-	if initialBudget > pool {
-		return Outcome{
-			Status:     OutcomePreCheckReject,
-			RejectCode: "exceeds_node_capacity",
-			RejectMsg:  fmt.Sprintf("initial reservation %d > pool %d", initialBudget, pool),
-		}
-	}
-	if initialBudget > startupPool {
-		return Outcome{
-			Status:     OutcomePreCheckReject,
-			RejectCode: "exceeds_startup_pool",
-			RejectMsg:  fmt.Sprintf("initial reservation %d > startup_pool %d", initialBudget, startupPool),
-		}
-	}
-
-	// 4. zone red/critical — system protection (independent of pool math)
-	if zone == ZoneRed || zone == ZoneCritical {
-		return Outcome{
-			Status:     OutcomeLongTermReject,
-			RejectCode: "zone_critical",
-			RejectMsg:  fmt.Sprintf("node in zone %s, refusing new admission", zone),
-		}
-	}
-
-	// 5. budget headroom — both gates
-	mainHeadroom := uint64(0)
-	if mainReserved <= pool && emerg <= pool-mainReserved {
-		mainHeadroom = pool - mainReserved - emerg
-	}
-	if initialBudget > mainHeadroom {
-		return Outcome{
-			Status: OutcomeShortTermBlock,
-			Block:  BlockedByMainBudget,
-		}
-	}
-
-	startupHeadroom := uint64(0)
-	if startupPool > startupInFlight {
-		startupHeadroom = startupPool - startupInFlight
-	}
-	if initialBudget > startupHeadroom {
-		return Outcome{
-			Status: OutcomeShortTermBlock,
-			Block:  BlockedByStartupBudget,
-		}
+	oc := a.state.AnalyzeLaunch(req.SandboxID, initialBudget, launch)
+	if oc.Status != OutcomeAdmitted {
+		return oc
 	}
 
 	// 6. token bucket
@@ -568,6 +565,10 @@ func (a *AdmissionController) ConsumeToken() bool {
 // for arranging conn-EOF monitoring (the goroutine that calls
 // PendingAdmit.cancel on read EOF). Returns false if queue is at cap.
 func (a *AdmissionController) Enqueue(req *Message, conn net.Conn, peerPID int) (*PendingAdmit, bool) {
+	launch, err := a.resolveLaunch(req.SandboxID, peerPID)
+	if err != nil {
+		return nil, false
+	}
 	a.queueMu.Lock()
 	defer a.queueMu.Unlock()
 	if a.queue.Len() >= a.policy.QueueMaxDepth {
@@ -577,6 +578,7 @@ func (a *AdmissionController) Enqueue(req *Message, conn net.Conn, peerPID int) 
 		req:       req,
 		conn:      conn,
 		peerPID:   peerPID,
+		identity:  launch.Identity,
 		queuedAt:  time.Now(),
 		queuedPos: a.queue.Len(),
 		cancelCh:  make(chan struct{}),

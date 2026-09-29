@@ -610,7 +610,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;先把当前完整 owner 原子转为内部 `deleting`,从节点 cache/full snapshot 排除并在返回前发布 route Delete,再由 finalizer 取消 launch,fence runner,在 allocation fence 内 detach 并 durable exact-clear network tuple,删除 RunDir/BaseDir 并 hard-delete row;route Delete 只表示 projection withdrawal,pending 时重复调用幂等 |
 | resume | `POST /sandboxes/{id}/connect` | body `{timeout:秒, memory?:bool\|null}`;`memory` 在本实现中 nil=auto,true=memory,false=cold;paused 在返回前原子变为 `starting` 并持久化 `launch_mode`;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 launch |
 | exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,body 可含 `ttlSeconds` 和 CEL `conditions`,并可携 `X-Kuasar-Migration-Token`;不创建 guest process |
-| pause | `POST /sandboxes/{id}/pause` → 204 | body `memory` omitted/null/true 保存 Snapshot S,false 保存 Sandbox E;false 与 snapshot-only merge/drop 字段组合返回 400;已暂停或正在 starting 回 409 |
+| pause | `POST /sandboxes/{id}/pause` → 204 | body `memory` omitted/null/true 保存 Snapshot S,false 保存 Sandbox E;false 与 snapshot-only merge/drop 字段组合返回 400;普通已暂停或正在 starting 回 409；缺省内存 Pause 可直接接管资源暂停，不再 capture |
 | timeout | `POST /sandboxes/{id}/timeout` | body `{timeout:秒}`,重置 TTL;starting 允许窄字段更新 |
 
 兼容范围以实际验证的上游 API/SDK 版本和测试为准。2026-09-07 核验的 E2B 官方
@@ -1850,6 +1850,24 @@ UDS path。任一步失败都保留尚未完成的字段供当前进程或 start
 row 只保留 BaseDir/checkpoint 与 source；Resume/Wake/Exec 在取得新 runtime owner 前完成 backlog，
 并在 `paused -> starting` acceptance 中原子恢复 canonical RunDir/UDS。这样 paused BaseDir 永不被
 runtime cleanup 删除，显式 Delete 仍可从 fully-cleaned paused row 删除 BaseDir 后 hard-delete。
+
+启用 `resource_listen` 时，节点执行[来源无关的有效水位矩阵](node-resource_zh.md#42-rawzone-与有效-zone)：
+green/yellow 允许新建和普通恢复，red 允许普通恢复，critical 保留当前资源暂停恢复资格。
+Snapshot 模板创建仍属于 Create。全部入口分类最终解析后的操作，已 accepted starting
+在水位改变后仍保留原异步身份。
+
+资源压力调用现有完整内存 Pause，包括 native exec quiesce/cleanup。既有 SQLite 行记录
+resource-pressure 原因、当前恢复义务、版本及连续运行起点。单后台恢复 worker 与真实 Proxy
+Wake 共用 launch singleflight；实际 running 提交才解除义务并重置运行起点，runner 创建或
+打开 snapshot 均不代表履约。清理 ownership 与资源 Release 仍是不同事实。
+
+对授权的 resource-paused 沙箱，缺省内存 Pause 在 Hook 及完整记录 CAS 复核后，原子接管
+保存源为普通显式暂停。身份/source/清理保持不变，不重新 capture 或启动 VM。取消资源后台
+恢复及未兑现 hold，State 同为 paused 也发布原因更新。显式 capture 选项或 filesystem-only
+Pause 返回 400，因为无法认证新的 capture 动作已满足；普通重复 Pause 与 starting 仍为 409。
+接管重启后仍有效。后续真实 Wake 按普通资格执行，合法保存 Snapshot 仍有完整预算恢复能力。
+不引入永久用户暂停锁，不恢复被清理的 exec 子进程，也不重放已投递旧 VM 的请求。
+Q、critical 退出、存储和记账规则见[资源生命周期](node-resource_zh.md#64-资源-pause恢复与显式接管)。
 
 ### 8.1 Artifact lifecycle、转模板与迁移
 

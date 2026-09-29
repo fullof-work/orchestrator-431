@@ -114,7 +114,7 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 	}
 
 	if cfg.ResourceListen != nil && cfg.ResourceListen.Enabled {
-		probe, err := StartResourceController(ctx, cfg.ResourceListen, resolvedResources, nodepath.SandboxRunRoot(cfg.Paths.RunRoot), logger)
+		probe, err := StartResourceController(ctx, cfg.ResourceListen, resolvedResources, nodepath.SandboxRunRoot(cfg.Paths.RunRoot), logger, core)
 		if err != nil {
 			return fmt.Errorf("resource_listen: %w", err)
 		}
@@ -172,7 +172,7 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		close(startedExtension.statsReady)
 	}
 	configServer := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
-		Provider: core, Admin: core, MMDSRouteSecretAdmin: core, BuilderAdmissionAdmin: core, BuilderActionAdmin: core,
+		Provider: core, Admin: core, MMDSRouteSecretAdmin: core, BuilderAdmissionAdmin: core, BuilderActionAdmin: core, ResourcePressureAdmin: core,
 		MaxMMDSRouteSecretValueBytes: cfg.MMDS.Routes.MaxSecretValueBytes,
 		API:                          apiHandler, AdminPidfile: cfg.Paths.AdminPidfile,
 		RouteSource: core, Plugins: plugins, PluginPidfile: cfg.Paths.PluginPidfile,
@@ -204,6 +204,7 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 	if err := core.StartRunPools(ctx); err != nil {
 		return err
 	}
+	go core.RunMemoryPressure(ctx)
 	go core.BuildPool(ctx, 2*time.Second)
 	if startNodeLink != nil {
 		startNodeLink()

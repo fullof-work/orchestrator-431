@@ -32,6 +32,7 @@ type Resolved struct {
 
 	MemoryGrantPerSecBytes uint64
 
+	Pressure  PressurePolicy
 	Admission AdmissionPolicy
 	Allocator AllocatorPolicy
 
@@ -134,6 +135,38 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 		operationalMargin = nodeBudget
 	}
 	pool := nodeBudget - operationalMargin
+	if pool == 0 || out.Watermarks.HighFactor >= 1-out.Watermarks.EmergencyFactor {
+		return nil, fmt.Errorf("watermarks require P > 0 and high_factor < 1-emergency_factor")
+	}
+	low := scaleUint64Floor(pool, out.Watermarks.LowFactor)
+	high := scaleUint64Floor(pool, out.Watermarks.HighFactor)
+	critical := pool - scaleUint64Floor(pool, out.Watermarks.EmergencyFactor)
+	if low >= high || high >= critical {
+		return nil, fmt.Errorf("rounded memory thresholds must satisfy Ty < Tr < Tc")
+	}
+	durations := []struct {
+		name, value string
+		target      *time.Duration
+	}{
+		{"interval", c.Pressure.Interval, &out.Pressure.Interval},
+		{"failure_interval", c.Pressure.FailureInterval, &out.Pressure.FailureInterval},
+		{"critical_exit_hold", c.Pressure.CriticalExitHold, &out.Pressure.CriticalExitHold},
+		{"red_to_yellow_hold", c.Pressure.RedToYellowHold, &out.Pressure.RedToYellowHold},
+		{"yellow_to_green_hold", c.Pressure.YellowToGreenHold, &out.Pressure.YellowToGreenHold},
+		{"minimum_run_time", c.Pressure.MinimumRunTime, &out.Pressure.MinimumRunTime},
+	}
+	for _, d := range durations {
+		parsed, err := time.ParseDuration(d.value)
+		if err != nil {
+			return nil, fmt.Errorf("pressure.%s: %w", d.name, err)
+		}
+		*d.target = parsed
+	}
+	out.Pressure.CriticalAfterRounds, out.Pressure.PauseAfterRounds = c.Pressure.CriticalAfterRounds, c.Pressure.PauseAfterRounds
+	if err := out.Pressure.Validate(); err != nil {
+		return nil, err
+	}
+
 	if !finiteFactor(c.RateLimits.MemoryGrantPerSecFactor) || c.RateLimits.MemoryGrantPerSecFactor <= 0 ||
 		c.RateLimits.MemoryGrantPerSecFactor > 1 {
 		return nil, fmt.Errorf("rate_limits.memory_grant_per_sec_factor must be > 0 and <= 1")

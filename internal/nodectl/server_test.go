@@ -73,6 +73,7 @@ func TestFeatureAdmitDoesNotOpenLifecycleLease(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "cgroups")
 	state := makeState(8<<30, 0)
+	state.Wm.StartupFactor = .5
 	srv := &Server{
 		State: state, Inventory: &Inventory{
 			ControllerSocket: filepath.Join(dir, "missing-controller.sock"),
@@ -283,10 +284,11 @@ func TestConcurrentAdmitAndBudgetGrowCannotOversubscribePool(t *testing.T) {
 		t.Fatalf("Admit response = %+v", response)
 	}
 	response := <-growDone
-	if response.Type != TypeBudgetResponse || response.GrantedDelta != 0 || response.NewAllocatable != 300<<20 {
+	wantGrant := state.AllocatablePool.MemoryBytes - scaleUint64Floor(state.AllocatablePool.MemoryBytes, state.Wm.EmergencyFactor) - (900 << 20)
+	if response.Type != TypeBudgetResponse || response.GrantedDelta != wantGrant || response.NewAllocatable != (300<<20)+wantGrant {
 		t.Fatalf("post-Admit grow response = %+v", response)
 	}
-	if snapshot := state.ResourceSnapshot(); snapshot.Reserved.MemoryBytes != 900<<20 ||
+	if snapshot := state.ResourceSnapshot(); snapshot.Reserved.MemoryBytes != (900<<20)+wantGrant ||
 		snapshot.Reserved.MemoryBytes > snapshot.AllocatablePool.MemoryBytes {
 		t.Fatalf("Admit/grow oversubscribed state: %+v", snapshot)
 	}

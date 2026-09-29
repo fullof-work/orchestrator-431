@@ -20,10 +20,12 @@ func adminClient(socketPath string) (*nodectl.Client, error) {
 // inside serve (resource_listen); these are admin / inspection clients to it.
 func resourceCmd(args []string) int {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: node-ctl resource {status|list|drain} ...")
+		fmt.Fprintln(os.Stderr, "usage: node-ctl resource {status|list|drain|pressure} ...")
 		return 2
 	}
 	switch args[0] {
+	case "pressure":
+		return pressureCmd(args[1:])
 	case "status":
 		return statusCmd(args[1:])
 	case "list":

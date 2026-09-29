@@ -409,7 +409,7 @@ func (v *WorkerView) ActivateRoute(ctx context.Context, expected proxy.RouteBind
 		}
 		return proxy.Route{}, false, nil
 	}
-	r, found, _ := v.table.LookupRevision(expected.SandboxID)
+	r, found, initialRev := v.table.LookupRevision(expected.SandboxID)
 	binding, present := workerRouteBinding(r, found, expected.Target)
 	if !present || binding.TrafficPolicyInvalid || binding != expected || !v.admissionBindingValid(expected.Admission) {
 		return proxy.Route{}, false, nil
@@ -423,7 +423,7 @@ func (v *WorkerView) ActivateRoute(ctx context.Context, expected proxy.RouteBind
 		v.wake(expected.SandboxID)
 		woke = true
 	}
-	return v.waitRouteActivated(ctx, expected, woke, seenStarting)
+	return v.waitRouteActivated(ctx, expected, woke, seenStarting, initialRev)
 }
 
 func workerRouteBinding(r routesync.RouteEntry, found bool, target proxy.ConnectTarget) (proxy.RouteBinding, bool) {
@@ -448,14 +448,15 @@ func workerDialRoute(r routesync.RouteEntry, expected proxy.RouteBinding) proxy.
 	return proxy.RouteForTarget(types.Profile(r.Profile), r.EnvdUDS, r.CiUDS, r.FloatingIP, expected.Target)
 }
 
-func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.RouteBinding, woke, seenStarting bool) (proxy.Route, bool, error) {
+func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.RouteBinding, woke, seenStarting bool, initialRev uint64) (proxy.Route, bool, error) {
 	deadline := time.Now().Add(v.parkTimeout())
+	nextWake := time.Now().Add(time.Second)
 	for {
 		if err := ctx.Err(); err != nil {
 			return proxy.Route{}, false, err
 		}
 		rev := v.table.Rev()
-		r, found := v.table.Lookup(expected.SandboxID)
+		r, found, routeRev := v.table.LookupRevision(expected.SandboxID)
 		binding, present := workerRouteBinding(r, found, expected.Target)
 		if !present || binding.TrafficPolicyInvalid || binding != expected || !v.admissionBindingValid(expected.Admission) {
 			return proxy.Route{}, false, nil
@@ -470,17 +471,25 @@ func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.Rout
 		case routesync.StateStarting:
 			seenStarting = true
 		case routesync.StatePaused:
-			if seenStarting {
+			if seenStarting || (woke && routeRev != initialRev) {
 				return proxy.Route{}, false, nil
 			}
-			if !woke && v.wake != nil {
+			if (!woke || !time.Now().Before(nextWake)) && v.wake != nil {
 				v.wake(expected.SandboxID)
 				woke = true
+				nextWake = time.Now().Add(time.Second)
 			}
 		default:
 			return proxy.Route{}, false, nil
 		}
-		if !v.waitChange(ctx, deadline, rev) {
+		waitUntil := deadline
+		if !seenStarting && v.wake != nil && nextWake.Before(waitUntil) {
+			waitUntil = nextWake
+		}
+		if !v.waitChange(ctx, waitUntil, rev) {
+			if ctx.Err() == nil && time.Now().Before(deadline) {
+				continue
+			}
 			if err := ctx.Err(); err != nil {
 				return proxy.Route{}, false, err
 			}
@@ -618,6 +627,7 @@ func (v *WorkerView) waitExecRunning(
 	initialRev uint64,
 ) (proxy.ExecIdentity, bool, error) {
 	deadline := time.Now().Add(v.parkTimeout())
+	nextWake := time.Now().Add(time.Second)
 	for {
 		if err := ctx.Err(); err != nil {
 			return proxy.ExecIdentity{}, false, err
@@ -636,7 +646,19 @@ func (v *WorkerView) waitExecRunning(
 		} else if seenStarting || (woke && routeRev != initialRev) {
 			return proxy.ExecIdentity{}, false, nil
 		}
-		if !v.waitChange(ctx, deadline, rev) {
+		if !seenStarting && r.State == routesync.StatePaused && v.wake != nil && !time.Now().Before(nextWake) {
+			v.wake(sid)
+			woke = true
+			nextWake = time.Now().Add(time.Second)
+		}
+		waitUntil := deadline
+		if !seenStarting && v.wake != nil && nextWake.Before(waitUntil) {
+			waitUntil = nextWake
+		}
+		if !v.waitChange(ctx, waitUntil, rev) {
+			if ctx.Err() == nil && time.Now().Before(deadline) {
+				continue
+			}
 			if err := ctx.Err(); err != nil {
 				return proxy.ExecIdentity{}, false, err
 			}

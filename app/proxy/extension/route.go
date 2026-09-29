@@ -45,6 +45,10 @@ const (
 // Revision changes when the core route table publishes a new lifecycle
 // incarnation. Mutating this value cannot affect proxy state.
 type RouteView struct {
+	PauseReason            string
+	ResourceObligation     bool
+	PressureVersion        uint64
+	RunningSinceUnixNano   int64
 	SandboxID              string // node-local route lookup key
 	StableID               string // identity preserved across node-local ID changes
 	Profile                Profile

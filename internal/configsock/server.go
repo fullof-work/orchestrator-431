@@ -475,6 +475,7 @@ type Deps struct {
 	MMDSRouteSecretAdmin         MMDSRouteSecretAdmin
 	BuilderActionAdmin           BuilderActionAdmin
 	BuilderAdmissionAdmin        BuilderAdmissionAdmin
+	ResourcePressureAdmin        ResourcePressureAdmin
 	MaxMMDSRouteSecretValueBytes int
 	API                          http.Handler     // api plane (e2b control plane + export/import); the fallback
 	AdminPidfile                 string           // optional PID allowlist gating the admin plane ("" => socket perms only)
@@ -571,6 +572,9 @@ func (s *Server) router() http.Handler {
 	if s.deps.BuilderActionAdmin != nil {
 		mux.HandleFunc("POST "+PathAdminBuildCancel, s.handleAdminBuildAction)
 		mux.HandleFunc("DELETE "+PathAdminBuildDelete, s.handleAdminBuildAction)
+	}
+	if s.deps.ResourcePressureAdmin != nil {
+		mux.HandleFunc("GET "+PathAdminResourcePressure, s.handleAdminResourcePressure)
 	}
 	if s.deps.BuilderAdmissionAdmin != nil {
 		mux.HandleFunc("GET "+PathAdminBuilderAdmission, s.handleAdminBuilderAdmission)

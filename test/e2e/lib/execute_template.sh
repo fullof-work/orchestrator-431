@@ -41,8 +41,9 @@ echo "==> built template: $TEMPLATE"
 
 }
 
-build_image_template() {
-code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl","cpuCount":2,"memoryMB":6144}')
+build_image_template() { # optional profile, default e2b
+local profile="${1:-e2b}"
+code=$(req POST /v3/templates "$AK" "{\"name\":\"proxy-tmpl\",\"profile\":\"$profile\",\"cpuCount\":2,\"memoryMB\":6144}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)
 BID=$(json_field "$WORK/resp.body" buildID)

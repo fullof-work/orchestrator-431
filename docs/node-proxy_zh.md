@@ -137,6 +137,12 @@ client / cluster-router ── data ───► Proxy DataEndpoint
 
 ## 4. routesync 与共享路由视图
 
+资源暂停与显式暂停都在既有认证策略通过后 park。节点依据当前 durable intent 判定资格：
+接管取消资源后台恢复及 critical 豁免，但真实仍驻留的请求或后续 Wake 可以按普通规则重验。
+Starting 等待新的 running endpoint。不重放已投递的非幂等请求，也不保留已经清理的 native
+exec 子进程。压力事实随完整 route sync/Bookmark 和 extension 投影收敛，不进入 NodeList 或
+Cluster 选址决策。
+
 routesync 仍是帧化 JSON over h2c,由 proxy master 拨 conductor:
 
 ```text
@@ -215,14 +221,16 @@ launch owner 推进,Activate 只等待 running/delete/paused 更新,不得再发
 全局 revision/notify 只负责唤醒检查;worker 以该 SID 的 live 或终态 revision 判断 Wake
 是否已收到终态回应。live 路由、终态 cache 和 revision 在同一次 table seqlock snapshot
 中读取,waiter 不会把旧 missing/paused 路由与新 revision 混合为假终态。重复的相同 paused
-Upsert 不推进 per-SID revision,因此订阅重放不能伪装成 Wake 的完成响应。live hash 的删除
+Upsert 不推进 per-SID revision,因此订阅重放不能伪装成 Wake 的完成响应。只有暂停原因、恢复义务、压力版本或运行起点变化时，SHM 和全局通知仍更新，但保留 activation revision；显式接管必须传到全部 reader，不能伪装为启动失败。live hash 的删除
 会在同一 table seqlock 下 backshift 并立即回收槽位;终态 cache 固定最多 4096 条且不含任何
 凭据。极端 churn 下 cache 碰撞只会淘汰较旧的终态相关性,对应 waiter 保守地继续 park 到
 后续状态或 timeout,不会错误路由或把无关 SID 当作 Wake 结果。
-正常的单次 Wake 路径中,即使异步共享表收敛把中间 starting 与随后 paused/Delete 合并,
+正常 activation 路径中,即使异步共享表收敛把中间 starting 与随后 paused/Delete 合并,
 终态 revision 仍会让 waiter 及时观察 rollback;只有前述极端 cache 淘汰才退化为保守 timeout。
-一个请求只允许在初始 missing/paused 发一次 Wake;观察过 starting 后回到 paused 不得再次
-Wake。
+授权请求尚未投递且同一 binding 仍为 paused 时，可在原 park deadline 内至多每秒重试一次 Wake，
+使普通暂停请求在 critical 缓解后重新判断资格。master 合并待发送 Wake，conductor 保持唯一
+launch owner。观察到 starting，或该 SID 生命周期 revision 证明合并了 starting→paused
+回滚后，该请求结束，不再 Wake。
 
 共享视图是异步收敛的路由缓存。默认创建使用 UUID,集群 NodeSandboxID 使用
 `<stableSandboxID>-g<SandboxGeneration>`,正常流程不会让不同逻辑沙箱复用同一个
@@ -243,7 +251,7 @@ MMDS token 签名,不等于 route secret values;后者仅经上述可信投影�
 `MaxInflightPatch` 只在 routesync wire 上携带 Sandbox 显式叶子;master 将目标节点
 `proxy.yaml` 默认值与该 patch 合并后,把 fixed effective value 及
 `{admission slot,generation}` 写入 route SHM,不会把 pointer 写入 SHM 或用于 route equality。
-当前内部兼容边界为 routesync version 8、route SHM schema 8、worker bootstrap/config/FD
+当前内部兼容边界为 routesync version 8、route SHM schema 9、worker bootstrap/config/FD
 protocol version 2，以及 admission arena version 2。这些都是内部 hard cut；协议版本不匹配的
 conductor/proxy/registry/router 或旧 SHM/bootstrap 不兼容且 fail closed。
 

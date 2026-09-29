@@ -259,7 +259,7 @@ builder:                                           # Build resources are separat
 # density; socket is the sole endpoint and its canonical identity is injected into
 # sandbox YAML + lease/inventory). Absent/disabled = static cgroup. The tuning
 # is inlined here (no separate file). Inspect / operate with:
-# node-ctl resource {status|list|drain}.
+# node-ctl resource {status|list|drain}; resource pressure uses the control socket.
 # resource_listen:
 #   enabled: true
 #   socket: /run/sandbox-resource.sock           # "" = pkg/resource default (sandbox-ctl's default)
@@ -270,6 +270,7 @@ builder:                                           # Build resources are separat
 #   # watermarks: { operational_margin_factor: 0.10, high_factor: 0.85, low_factor: 0.70, emergency_factor: 0.05, startup_factor: 0.50 }
 #   # rate_limits: { memory_grant_per_sec_factor: 0.05 }
 #   # admission: { rate: 4, burst: 16, startup_ttl: 30s, queue_ttl: 30s, queue_max_depth: 256 }
+#   # pressure: { interval: 1s, failure_interval: 500ms, critical_after_rounds: 3, pause_after_rounds: 3, critical_exit_hold: 5s, red_to_yellow_hold: 30s, yellow_to_green_hold: 30s, minimum_run_time: 30s }
 checkpoint:                                        # paused-state capture
   mode: local                                     # local | bundle
   # merge_ref: false                              # omit/null => sandbox-ctl default

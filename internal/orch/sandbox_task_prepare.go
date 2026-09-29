@@ -291,6 +291,10 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	}
 	running := o.mutateCached(sb.ID, func(cached *types.Sandbox) {
 		cached.State = types.StateRunning
+		cached.PauseReason, cached.ResourceObligation = "", false
+		cached.PressureVersion++
+		cached.RunningSinceUnixNano = time.Now().UnixNano()
+		cached.PressureSinceUnixNano = 0
 		cached.ResumeSource = summary.RootSource
 		cached.RunID = sb.RunID
 		cached.LaunchMode = ""
@@ -298,6 +302,10 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	if running == nil {
 		running = cloneSandbox(sb)
 		running.State = types.StateRunning
+		running.PauseReason, running.ResourceObligation = "", false
+		running.PressureVersion = sb.PressureVersion + 1
+		running.RunningSinceUnixNano = time.Now().UnixNano()
+		running.PressureSinceUnixNano = 0
 		running.ResumeSource = summary.RootSource
 		running.LaunchMode = ""
 		o.cache(running)

@@ -3,6 +3,8 @@ package orch
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,10 +96,35 @@ func (v *trackedRestoreVS) Detach(context.Context, string) error {
 
 func (*trackedRestoreVS) TapFD(string) vswitch.TapFD { return vswitch.TapFD{} }
 
+// Observe the consumer-side preparation boundary without adding a production
+// test hook or replacing the network ownership fence.
+type restoreSummaryObserver struct {
+	slog.Handler
+	prepared chan struct{}
+	once     *sync.Once
+}
+
+func (h *restoreSummaryObserver) Handle(ctx context.Context, r slog.Record) error {
+	if r.Message == "sandbox task artifact prepared" {
+		h.once.Do(func() { close(h.prepared) })
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h *restoreSummaryObserver) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &restoreSummaryObserver{Handler: h.Handler.WithAttrs(attrs), prepared: h.prepared, once: h.once}
+}
+
+func (h *restoreSummaryObserver) WithGroup(name string) slog.Handler {
+	return &restoreSummaryObserver{Handler: h.Handler.WithGroup(name), prepared: h.prepared, once: h.once}
+}
+
 func TestRestoreCancelAfterSummaryBeforeAttachHasNoNetworkOwnership(t *testing.T) {
 	cfg := &config.Config{}
 	lc := &countingLauncher{}
-	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	prepared := make(chan struct{})
+	observer := &restoreSummaryObserver{Handler: slog.NewTextHandler(io.Discard, nil), prepared: prepared, once: &sync.Once{}}
+	o, ctx := newAsyncConnectTestOrchestratorWithLogger(t, cfg, lc, slog.New(observer))
 	vs := &canceledRestoreVS{}
 	o.vs = vs
 	// Hold the existing allocation fence so the worker cannot enter Attach after
@@ -119,6 +146,16 @@ func TestRestoreCancelAfterSummaryBeforeAttachHasNoNetworkOwnership(t *testing.T
 		t.Fatal(err)
 	}
 	attempt := waitForAcceptedPrepare(t, o, created.ID)
+	// Publishing the summary does not prove launchArtifactSandbox consumed it:
+	// cancellation could otherwise win its select and correctly skip Attach.
+	// Wait until that consumer passed the summary branch, while the existing
+	// allocation mutex still prevents the network call. Keep the exact one
+	// context-rejected Attach and zero retained ownership assertions below.
+	select {
+	case <-prepared:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restore worker did not consume the accepted summary")
+	}
 	attempt.cancel()
 	o.networkAllocationMu.Unlock()
 	locked = false

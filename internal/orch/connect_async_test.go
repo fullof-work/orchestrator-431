@@ -699,6 +699,11 @@ func newBlockedResumeFixture(t *testing.T) blockedResumeFixture {
 
 func newAsyncConnectTestOrchestrator(t *testing.T, cfg *config.Config, lc *countingLauncher) (*Orchestrator, context.Context) {
 	t.Helper()
+	return newAsyncConnectTestOrchestratorWithLogger(t, cfg, lc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func newAsyncConnectTestOrchestratorWithLogger(t *testing.T, cfg *config.Config, lc *countingLauncher, logger *slog.Logger) (*Orchestrator, context.Context) {
+	t.Helper()
 	dir := shortOrchestratorTestDir(t)
 	if cfg.Paths.RunRoot == "" {
 		cfg.Paths.RunRoot = filepath.Join(dir, "run")
@@ -718,7 +723,7 @@ func newAsyncConnectTestOrchestrator(t *testing.T, cfg *config.Config, lc *count
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o := New(cfg, st, lc, stubVS{}, logger)
 	o.allowLegacyAssignmentWithoutRunSession = true
 	o.SetProxyRouteBarrierCoordinator(immediateRouteBarrierCoordinator{})
 	lc.orch = o

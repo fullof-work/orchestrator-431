@@ -444,8 +444,11 @@ runner/network/resources 清理。不引入保留 VMM 的 pause、page swapper�
 snapshot 格式。Checkpoint 必须落到磁盘，拒绝 tmpfs/ramfs；只有实际 Release/reconcile
 才能复用额度。Capture 失败退避，不丢弃已有保存源。
 
-单后台恢复 worker 按最老义务服务，与外部 Wake 共用 SID launch group。观察到稳定余量
-后准备恢复；随后 sandboxer 给出精确 I，最终资源准入等待完整预算才启动 VM。
+单后台恢复 worker 按最老义务服务，与外部 Wake 共用 SID launch group。在 worker 启动及其
+自身 capture/recovery 完成后，用一个有界间隔控制准备恢复的节奏。无关沙箱的 reservation
+变化不重置该间隔；繁忙节点不能要求全节点停止分配，才恢复无人访问的资源暂停沙箱。
+`headroom_stable` 仅用于诊断，不是恢复准入前提。随后 sandboxer 给出精确 I，最终资源准入
+仍等待完整预算才启动 VM；节奏计时不授予内存。
 Starting 在实际 running 提交前仍属于 Q。最短运行窗口抑制刚恢复就换出，真实宿主安全
 压力可打破该软保护。有效需求可在 critical 中协调进一步 Pause，不等待被 Q 自身阻挡的
 降级。制品缺失/损坏、磁盘满/慢和容量失败保留源与义务并进入操作诊断。既有 Deadline

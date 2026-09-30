@@ -330,6 +330,10 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 	}
 	done := make(chan result, 2)
 	pauseBusy, resumeBusy := false, false
+	// Pace our own recovery work, not every unrelated reservation update.
+	// A busy node may never have a globally quiet interval even with ample
+	// free capacity; complete-budget admission remains the resource gate.
+	resumeAfter := time.Now().Add(p.policy.Interval)
 	backoff := map[string]time.Time{}
 	var persisted uint64 = ^uint64(0)
 	var hostSampleAt time.Time
@@ -345,6 +349,7 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 				kind = "pause"
 			}
 			o.recordPressureResult(r.sid, kind, r.err)
+			resumeAfter = time.Now().Add(p.policy.Interval)
 			if r.pause {
 				pauseBusy = false
 			} else {
@@ -398,7 +403,7 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 		p.resultMu.Lock()
 		p.blocked = workerBlocked
 		p.resultMu.Unlock()
-		if !resumeBusy && snapshot.HeadroomStable && !p.admission.IsDrained() {
+		if !resumeBusy && !now.Before(resumeAfter) && !p.admission.IsDrained() {
 			// Age order gives unattended recoveries eventual service. A real Wake
 			// already shares the same launch claim and cannot create another runner.
 			sort.Slice(rows, func(i, j int) bool {

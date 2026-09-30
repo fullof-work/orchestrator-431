@@ -413,9 +413,13 @@ backed; tmpfs/ramfs is rejected. Only observed Release/reconciliation makes
 memory reusable. Capture failure backs off without discarding a saved source.
 
 One background recovery worker services the oldest outstanding obligation,
-using the common SID launch group also used by external Wake. Preparation
-starts after stable observed headroom; sandboxer subsequently supplies exact I
-and the final resource admission waits for its complete budget before VM start.
+using the common SID launch group also used by external Wake. A bounded settling
+interval at worker startup and after its own capture/recovery completions paces
+preparation. Unrelated reservation changes do not restart that interval: a busy
+node must not require global allocation silence to recover an unattended sandbox.
+`headroom_stable` remains a diagnostic, not a recovery-admission prerequisite.
+Sandboxer subsequently supplies exact I, and final resource admission waits for
+its complete budget before VM start; the pacing timer does not grant memory.
 Starting remains in Q until actual running commit. The minimum running window
 limits immediate re-eviction, with an override for observed host safety pressure.
 A valid demand can coordinate further Pause while effective Zone stays critical;

@@ -513,3 +513,132 @@ func TestPressurePauseRejectsRAMBackedCheckpointMount(t *testing.T) {
 		t.Fatal("storage rejection changed lifecycle")
 	}
 }
+
+func TestPressureUnattendedRecoveryWithUnrelatedGrants(t *testing.T) {
+	cfg := &config.Config{}
+	lc := &countingLauncher{artifactPrepareErr: errors.New("saved snapshot unavailable")}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	sb := &types.Sandbox{ID: "unattended", Profile: types.ProfileBare, TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(), State: types.StatePaused, ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: checkpointSnapshotRef, SandboxRef: checkpointSandboxRef}, ResourceObligation: true, PauseReason: types.PauseReasonResource, PressureVersion: 7, PressureSinceUnixNano: time.Now().UnixNano(), ManifestKey: strings.Repeat("f", 64), APISecret: deriveTestAPISecret(t, strings.Repeat("f", 64)), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "sandboxes", "unattended")}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+	s := attachPressure(t, o)
+	policy := nodectl.DefaultPressurePolicy()
+	policy.Interval = 250 * time.Millisecond
+	o.memoryPressure.Load().policy = policy
+	if err := s.ConfigurePressure(policy, nodectl.PressureRecord{Zone: nodectl.ZoneCritical, Version: 1}); err != nil {
+		t.Fatal(err)
+	}
+	// Keep ample headroom but change another legitimate consumer's Budget
+	// much more often than the pressure scan. This must not block recovery.
+	if _, _, err := s.Admit(nodectl.AdmitSpec{SandboxID: "busy", Token: "busy", Capacity: nodectl.Resources{MemoryBytes: 1 << 30}, InitialBudget: 512 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.SetSettled("busy", 0, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	allocator := nodectl.NewAllocator(nodectl.AllocatorPolicy{MemoryGrantPerSecBytes: 4 << 30, MinGrantStep: 64 << 20, MaxGrantStep: 64 << 20})
+	workerCtx, cancel := context.WithCancel(ctx)
+	churnDone, workerDone := make(chan struct{}), make(chan struct{})
+	churnErr := make(chan error, 1)
+	go func() {
+		defer close(churnDone)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		current := uint64(512 << 20)
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			baseline, delta := current, uint64(64<<20)
+			if current > 512<<20 {
+				baseline, delta = 512<<20, 0
+			}
+			got, found, err := s.ReconcileAndGrant("busy", baseline, delta, nodectl.UrgencyNormal, allocator)
+			if err != nil || !found {
+				churnErr <- fmt.Errorf("churn found=%v: %w", found, err)
+				return
+			}
+			current = got.Reservation.ReservationMemory
+		}
+	}()
+	startedAt := time.Now()
+	go func() { defer close(workerDone); o.RunMemoryPressure(workerCtx) }()
+	defer func() { cancel(); <-workerDone; <-churnDone }()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for lc.starts.Load() == 0 {
+		select {
+		case err := <-churnErr:
+			t.Fatal(err)
+		case <-deadline.C:
+			p := s.PressureSnapshot()
+			t.Fatalf("background recovery starved by unrelated grants despite more than 3GiB available: starts=%d stable=%v Q=%d R=%d P=%d", lc.starts.Load(), p.HeadroomStable, p.Pending, p.ReservedMemory, p.PoolMemory)
+		case <-ticker.C:
+		}
+	}
+	if time.Since(startedAt) < policy.Interval {
+		t.Fatal("background recovery skipped its initial pacing interval")
+	}
+}
+
+func TestPressureRecoveryPacesSuccessiveWaiters(t *testing.T) {
+	cfg := &config.Config{}
+	started := make(chan struct{}, 4)
+	lc := &countingLauncher{artifactPrepareErr: errors.New("saved snapshot unavailable"), started: started}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	for _, id := range []string{"paced-first", "paced-second"} {
+		sb := &types.Sandbox{
+			ID: id, Profile: types.ProfileBare,
+			TemplateID:         types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(),
+			State:              types.StatePaused,
+			ResumeSource:       types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: checkpointSnapshotRef, SandboxRef: checkpointSandboxRef},
+			ResourceObligation: true, PauseReason: types.PauseReasonResource, PressureVersion: 7,
+			PressureSinceUnixNano: time.Now().UnixNano(),
+			ManifestKey:           strings.Repeat("f", 64), APISecret: deriveTestAPISecret(t, strings.Repeat("f", 64)),
+			BaseDir: filepath.Join(cfg.Paths.BaseRoot, "sandboxes", id),
+		}
+		materializeTestSandboxCredentials(t, sb)
+		if err := o.st.Put(ctx, sb); err != nil {
+			t.Fatal(err)
+		}
+		o.cache(sb)
+	}
+	s := attachPressure(t, o)
+	policy := nodectl.DefaultPressurePolicy()
+	policy.Interval = 200 * time.Millisecond
+	o.memoryPressure.Load().policy = policy
+	if err := s.ConfigurePressure(policy, nodectl.PressureRecord{Zone: nodectl.ZoneCritical, Version: 1}); err != nil {
+		t.Fatal(err)
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); o.RunMemoryPressure(workerCtx) }()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first unattended recovery did not start")
+	}
+	// A completed/failed attempt may wake the loop immediately. It must not
+	// release the next waiter without the coordinator's own settling period.
+	select {
+	case <-started:
+		t.Fatal("successive background recoveries were not paced")
+	case <-time.After(policy.Interval / 2):
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("next unattended recovery remained blocked")
+	}
+	if p := s.PressureSnapshot(); p.Pending != 2 || p.Zone != nodectl.ZoneCritical {
+		t.Fatalf("failed preparations lost their recovery obligations: %+v", p)
+	}
+}

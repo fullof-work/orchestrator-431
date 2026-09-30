@@ -307,7 +307,7 @@ yellow 不是节点拒绝 cluster-create 的模式。NodeList 不新增动态水
 失败轮次按同一有效需求及 launch/token 身份在时间推进后复核。并发重复、认证/参数错误、
 不可能满足的容量、drain、传输错误以及单纯启动槽/token 等待不计入。
 缺省三轮进入 critical，再三轮授权一次 Pause；下一次 Pause 需要新轮次。
-不足以形成 sandboxer 可执行 MemoryStep 的小额 reservation grant，不会抹去仍阻塞的需求。
+未增加 sandboxer 可执行 Budget 的 reservation grant，保留仍阻塞的需求及其下一可执行步长的额度保护。
 需求有效期独立于轮询，为 30 秒、三倍失败间隔、两倍扫描间隔中的最大值。
 因此来宾每五秒上报/重试的历史不会在两次请求之间被观察操作清空；观察本身不增加失败轮次。
 过期后新请求重新累计，未使用的过期保护即使尚未扫描也不能阻塞准入；过期不清除 reservation
@@ -335,8 +335,11 @@ NewReservation = CurrentReservation + GrantedDelta
 
 普通新增 grow 按实际 P-R-E 再扣除其他受益者未兑现保护；high 可用 E，但总量不超过 P。有效 red/critical 本身不禁止 runtime grow。已占账 replay 不重复计费或扣 token。选中的一个 resume/grow 需求保护释放空间，直到 Admit、可执行进展、取消或未兑现 hold 到期；resume 优先于 grow。取消保护不释放 live reservation。
 
-sandbox 可收到 partial grant。sandboxer 会先累积 reservation,只有当额度足以表示一个
-64MiB 对齐 Budget 时才执行 balloon deflate,因此取整不会制造未保留内存。
+sandbox 可收到 partial grant。sandboxer 会先累积 reservation，只有当额度足以表示一个
+balloon target 按 64 MiB 对齐的更大 Budget 时才执行 balloon deflate，因此取整不会制造未保留内存。
+Budget 边界相对于 Capacity：Capacity 为 1056 MiB 时，边界是 32/96/160/224/... MiB。
+从 160 授予到 192 MiB 会保留需求并保护剩余 32 MiB；达到 224 MiB 才构成可执行进展并清除该需求。
+Capacity 本身无需对齐。
 
 shrink 使用同一消息,但 `RequestedDelta=0`:sandbox 在本地完成 balloon inflate、
 current convergence 和 `memory.high` 顺序后,以较小的绝对 baseline 提交释放。node

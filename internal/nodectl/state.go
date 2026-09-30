@@ -1006,21 +1006,40 @@ func (s *State) ReconcileAndGrant(token string, current, requested uint64, urgen
 	}
 	// Progress means a Budget that the sandboxer can execute, not a small
 	// positive reservation grant or an unrelated successful RPC. Keep its
-	// canonical step; no guest memory measurement enters node accounting.
-	minimum := min(remaining, resource.MemoryStep-baseReservation%resource.MemoryStep)
+	// canonical target alignment, relative to Capacity; no guest memory
+	// measurement enters node accounting.
+	executableBefore, _ := executableMemoryBudget(r.Capacity.MemoryBytes, current)
+	_, nextStep := executableMemoryBudget(r.Capacity.MemoryBytes, baseReservation)
+	executableAfter, missingStep := executableMemoryBudget(r.Capacity.MemoryBytes, finalReservation)
+	minimum := min(remaining, nextStep)
 	if allocator.policy.MinGrantStep > 0 {
 		minimum = max(minimum, min(remaining, allocator.policy.MinGrantStep))
 	}
-	executableBefore := current / resource.MemoryStep
-	executableAfter := finalReservation / resource.MemoryStep
 	if remaining <= capRoom && current <= pool && remaining <= pool-current && headroom < minimum && executableAfter == executableBefore && decision.GrantedDelta < requested {
-		protect := min(remaining, resource.MemoryStep-finalReservation%resource.MemoryStep)
+		protect := min(remaining, missingStep)
 		s.failDemandLocked(key, r.SandboxID, r.Token, protect, executableAfter, false, s.pressure.clock())
 	} else if decision.GrantedDelta == requested || executableAfter > executableBefore || headroom >= minimum {
 		s.clearDemandLocked(key)
 	}
 	zone = s.memoryZoneLocked()
 	return GrantResult{Reservation: cloneReservation(r), Decision: decision, Zone: zone}, true, nil
+}
+
+// executableMemoryBudget returns the largest target-representable Budget at
+// most reservation, and the additional reservation needed for the next Budget
+// (zero at Capacity). Like sandboxer's alignedBudgetAtMostReservation, this
+// aligns the balloon target, so Budget has Capacity's MemoryStep remainder.
+// Subtraction keeps the calculation safe even at uint64's upper boundary.
+func executableMemoryBudget(capacity, reservation uint64) (budget, nextStep uint64) {
+	if reservation >= capacity {
+		return capacity, 0
+	}
+	offset := capacity % resource.MemoryStep
+	if reservation < offset {
+		return 0, offset - reservation
+	}
+	remainder := (reservation - offset) % resource.MemoryStep
+	return reservation - remainder, resource.MemoryStep - remainder
 }
 
 func (s *State) Heartbeat(token string, hostMemoryCurrent uint64, now time.Time) (Reservation, bool) {

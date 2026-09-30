@@ -1,6 +1,7 @@
 package nodectl
 
 import (
+	"math"
 	"net"
 	"testing"
 	"time"
@@ -245,5 +246,165 @@ func TestSavedSourceRequiresSnapshotBudgetAndAcceptedLaunchRetainsIdentity(t *te
 	}
 	if s.ResourceSnapshot().Reserved.MemoryBytes != 100 {
 		t.Fatal("accepted replay double charged")
+	}
+}
+
+// The balloon target is step-aligned, so a 1056 MiB Capacity has representable
+// Budgets 32, 96, 160, 224, ... MiB.
+func TestCapacityOffsetDoesNotInventProgress(t *testing.T) {
+	const mib = uint64(1 << 20)
+	const pool = 2048 * mib
+	const capacity = 1056 * mib
+	s := NewState(pool, 1000, 0, 0, Watermarks{LowFactor: .7, HighFactor: .85, EmergencyFactor: .05, StartupFactor: .5})
+	now := time.Now()
+	s.initPressureLocked()
+	s.pressure.clock = func() time.Time { return now }
+	installReservationForTest(t, s, Reservation{SandboxID: "grow", Token: "grow", Capacity: Resources{MemoryBytes: capacity}, ReservationMemory: 160 * mib, Stage: StageSettled})
+	filler := pool - scaleUint64Floor(pool, s.Wm.EmergencyFactor) - 160*mib
+	installReservationForTest(t, s, Reservation{SandboxID: "filler", Token: "filler", Capacity: Resources{MemoryBytes: pool}, ReservationMemory: filler, Stage: StageSettled})
+	a := NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: pool, MinGrantStep: 4 * mib, MaxGrantStep: 512 * mib})
+	for i := 0; i < 3; i++ {
+		if _, _, err := s.ReconcileAndGrant("grow", 160*mib, resource.MemoryStep, UrgencyNormal, a); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Second)
+	}
+	if len(s.PressureSnapshot().Demands) != 1 {
+		t.Fatal("fixture did not retain initial pressure")
+	}
+	if _, _, err := s.ReconcileAndGrant("filler", filler-32*mib, 0, UrgencyNormal, a); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.ReconcileAndGrant("grow", 160*mib, resource.MemoryStep, UrgencyNormal, a)
+	if err != nil || got.Reservation.ReservationMemory != 192*mib {
+		t.Fatalf("partial grant %+v %v", got, err)
+	}
+	p := s.PressureSnapshot()
+	// Executable Budget is still 160 MiB. Its wait and the remaining 32 MiB
+	// protection must not disappear merely because R crossed 192 MiB.
+	if len(p.Demands) != 1 || p.Protected != 32*mib || p.Demands[0].Rounds < 3 {
+		t.Fatalf("unexecutable partial grant erased pressure: %+v", p)
+	}
+	// Real progress clears the same established wait even when the caller
+	// requests a larger objective that cannot be fulfilled in this round.
+	now = now.Add(time.Second)
+	if _, _, err := s.ReconcileAndGrant("filler", filler-64*mib, 0, UrgencyNormal, a); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err = s.ReconcileAndGrant("grow", 192*mib, 96*mib, UrgencyNormal, a)
+	if err != nil || got.Reservation.ReservationMemory != 224*mib {
+		t.Fatalf("executable partial grant %+v %v", got, err)
+	}
+	if p := s.PressureSnapshot(); len(p.Demands) != 0 || p.Protected != 0 {
+		t.Fatalf("executable progress retained the established wait: %+v", p)
+	}
+}
+
+func TestCapacityOffsetRecognizesExecutableProgress(t *testing.T) {
+	const mib = uint64(1 << 20)
+	const pool = 2048 * mib
+	s := NewState(pool, 1000, 0, 0, Watermarks{LowFactor: .7, HighFactor: .85, EmergencyFactor: .05, StartupFactor: .5})
+	installReservationForTest(t, s, Reservation{SandboxID: "grow", Token: "grow", Capacity: Resources{MemoryBytes: 1056 * mib}, ReservationMemory: 192 * mib, Stage: StageSettled})
+	filler := pool - scaleUint64Floor(pool, s.Wm.EmergencyFactor) - 224*mib
+	installReservationForTest(t, s, Reservation{SandboxID: "filler", Token: "filler", Capacity: Resources{MemoryBytes: pool}, ReservationMemory: filler, Stage: StageSettled})
+	a := NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: pool, MinGrantStep: 4 * mib, MaxGrantStep: 512 * mib})
+	got, _, err := s.ReconcileAndGrant("grow", 192*mib, 96*mib, UrgencyNormal, a)
+	if err != nil || got.Reservation.ReservationMemory != 224*mib {
+		t.Fatalf("partial grant %+v %v", got, err)
+	}
+	if p := s.PressureSnapshot(); len(p.Demands) != 0 {
+		t.Fatalf("real 160->224 MiB executable progress counted as failure: %+v", p)
+	}
+}
+
+func TestExecutableMemoryBudget(t *testing.T) {
+	const step = resource.MemoryStep
+	const capacity = uint64(1<<30 + 4096)
+	for _, tc := range []struct {
+		name                                        string
+		capacity, reservation, wantBudget, wantNext uint64
+	}{
+		{"zero", 0, 0, 0, 0},
+		{"zero-clamped", 0, math.MaxUint64, 0, 0},
+		{"small-empty", 1, 0, 0, 1},
+		{"small-full", 1, 1, 1, 0},
+		{"below-step", step - 1, step - 2, 0, 1},
+		{"aligned-empty", step, 0, 0, step},
+		{"aligned-partial", step, 1, 0, step - 1},
+		{"aligned-full", step, step, step, 0},
+		{"offset-empty", capacity, 0, 0, 4096},
+		{"offset-below-first", capacity, 4095, 0, 1},
+		{"offset-first", capacity, 4096, 4096, step},
+		{"offset-absolute-step", capacity, step, 4096, 4096},
+		{"offset-next-budget", capacity, step + 4096, step + 4096, step},
+		{"offset-near-full", capacity, capacity - 1, capacity - step, 1},
+		{"offset-full", capacity, capacity, capacity, 0},
+		{"offset-clamped", capacity, math.MaxUint64, capacity, 0},
+		{"max-empty", math.MaxUint64, 0, 0, step - 1},
+		{"max-below-first", math.MaxUint64, step - 2, 0, 1},
+		{"max-first", math.MaxUint64, step - 1, step - 1, step},
+		{"max-absolute-step", math.MaxUint64, step, step - 1, step - 1},
+		{"max-near-full", math.MaxUint64, math.MaxUint64 - 1, math.MaxUint64 - step, 1},
+		{"max-full", math.MaxUint64, math.MaxUint64, math.MaxUint64, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			budget, next := executableMemoryBudget(tc.capacity, tc.reservation)
+			if budget != tc.wantBudget || next != tc.wantNext {
+				t.Fatalf("budget=%d next=%d, want %d/%d", budget, next, tc.wantBudget, tc.wantNext)
+			}
+			if budget > min(tc.capacity, tc.reservation) || (budget > 0 && (tc.capacity-budget)%step != 0) {
+				t.Fatalf("Budget exceeds reservation or has an unaligned target: %d", budget)
+			}
+			if tc.reservation < tc.capacity {
+				if next == 0 || next > tc.capacity-tc.reservation {
+					t.Fatalf("next step overflows Capacity: %d", next)
+				}
+				if (tc.capacity-(tc.reservation+next))%step != 0 {
+					t.Fatalf("next Budget has an unaligned target: %d", tc.reservation+next)
+				}
+			}
+		})
+	}
+}
+
+func TestCapacityOffsetGrowGrantPolicy(t *testing.T) {
+	const mib = uint64(1 << 20)
+	const pool = 2048 * mib
+	for _, tc := range []struct {
+		name                                         string
+		current, reserved, requested, headroom       uint64 // MiB
+		minGrant, maxGrant, wantDelta, wantProtected uint64 // MiB
+		rate                                         uint64 // bytes/second
+	}{
+		{"reuse-unexecutable", 160, 192, 64, 0, 4, 512, 32, 32, 1},
+		{"reuse-executable", 192, 224, 96, 0, 4, 512, 32, 0, 1},
+		{"token-only", 192, 192, 96, 32, 4, 512, 0, 0, 1},
+		{"maximum-grant-only", 192, 192, 96, 32, 4, 16, 16, 0, pool},
+		{"complete-small-tail", 208, 208, 16, 16, 32, 512, 16, 0, pool},
+		{"partial-next-step", 192, 192, 96, 16, 4, 512, 16, 16, pool},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewState(pool, 1000, 0, 0, Watermarks{LowFactor: .7, HighFactor: .85, EmergencyFactor: .05, StartupFactor: .5})
+			installReservationForTest(t, s, Reservation{SandboxID: "grow", Token: "grow", Capacity: Resources{MemoryBytes: 1056 * mib}, ReservationMemory: tc.reserved * mib, Stage: StageSettled})
+			filler := pool - scaleUint64Floor(pool, s.Wm.EmergencyFactor) - (tc.reserved+tc.headroom)*mib
+			installReservationForTest(t, s, Reservation{SandboxID: "filler", Token: "filler", Capacity: Resources{MemoryBytes: pool}, ReservationMemory: filler, Stage: StageSettled})
+			a := NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: tc.rate, MinGrantStep: tc.minGrant * mib, MaxGrantStep: tc.maxGrant * mib})
+			got, found, err := s.ReconcileAndGrant("grow", tc.current*mib, tc.requested*mib, UrgencyNormal, a)
+			wantReservation := (tc.current + tc.wantDelta) * mib
+			if err != nil || !found || got.Decision.GrantedDelta != tc.wantDelta*mib || got.Reservation.ReservationMemory != wantReservation {
+				t.Fatalf("grant=%+v found=%v err=%v", got, found, err)
+			}
+			p := s.PressureSnapshot()
+			if p.ReservedMemory != filler+wantReservation || p.Protected != tc.wantProtected*mib {
+				t.Fatalf("incorrect charge/protection: %+v", p)
+			}
+			if tc.wantProtected == 0 {
+				if len(p.Demands) != 0 {
+					t.Fatalf("executable progress or grant policy counted as memory failure: %+v", p)
+				}
+			} else if len(p.Demands) != 1 || p.Demands[0].Rounds != 1 {
+				t.Fatalf("unexecutable partial grant lost blocked demand: %+v", p)
+			}
+		})
 	}
 }

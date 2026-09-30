@@ -278,8 +278,9 @@ launch/token identity. Concurrent duplicates, credential/shape errors,
 impossible capacity, drain, transport failures, and startup-slot/rate-token
 waits do not count. Three qualified rounds enter critical; three further
 rounds authorize one Pause. Another Pause needs fresh rounds. Reservation
-increments smaller than sandboxer's executable MemoryStep do not erase a
-still-blocked demand. Demand freshness is independent of polling: its bounded
+increments that do not increase sandboxer's executable Budget retain the
+still-blocked demand and protection for its next executable step.
+Demand freshness is independent of polling: its bounded
 window is the maximum of 30 seconds, three failure intervals and two scan
 intervals. This retains the guest's
 five-second report/retry history; observations never add failure rounds.
@@ -313,7 +314,7 @@ NewReservation = CurrentReservation + GrantedDelta
 
 Normal new growth uses actual `P-R-E`, less another selected waiter's unused protection; high urgency can use E but cannot exceed P. Effective red/critical does not itself deny runtime growth. Already-charged replay is reused without another charge or rate debit. One selected resume/grow demand protects released headroom until admission, executable progress, cancellation or expiration of an unused hold. Resume protection has priority over grow; a protection never subtracts a live reservation on cancellation.
 
-Partial grants are allowed. Sandboxer accumulates reservation first and deflates the balloon only when it can represent a 64 MiB-aligned Budget, so rounding cannot create unreserved memory.
+Partial grants are allowed. Sandboxer accumulates reservation first and deflates the balloon only when it can represent a larger Budget with a 64 MiB-aligned balloon target, so rounding cannot create unreserved memory. Budget boundaries are relative to Capacity: at Capacity 1056 MiB they are 32/96/160/224/... MiB. A grant from 160 to 192 MiB retains the demand and protects the remaining 32 MiB; reaching 224 MiB is executable progress and clears that demand. Capacity itself need not be aligned.
 
 Shrink uses the same message with RequestedDelta=0. After local balloon inflation, current convergence and ordered memory.high adjustment, the sandbox submits a smaller absolute baseline to release reservation. The node neither polls CH nor decides whether shrink has completed.
 

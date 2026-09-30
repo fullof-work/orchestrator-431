@@ -62,7 +62,7 @@ PY
         runner_lifecycle_check dead "$sid" "$before" 2>/dev/null && break
         sleep 0.1
     done
-    runner_lifecycle_check dead "$sid" "$before" || fail "runner-exit retained processes/paths or lost result"
+    runner_lifecycle_check dead "$sid" "$before" --diagnostics || fail "runner-exit retained processes/paths or lost result"
     cleanup_ms=$(( $(date +%s%3N) - killed ))
     for _ in $(seq 1 50); do
         code=$(DP_MAX_TIME=2 dp "49983-$sid" /health "$token" || true)

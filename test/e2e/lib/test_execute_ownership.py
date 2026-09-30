@@ -193,6 +193,28 @@ TAGS=()
 
 
 class RunnerLifecycleIdentity(unittest.TestCase):
+    def test_kernel_worker_is_not_a_second_userspace_vmm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            for pid, status in {
+                "101": "Name:\tcloud-hypervisor\nKthread:\t0\n",
+                "102": "Name:\tkvm-nx-lpage-recovery\nKthread:\t1\n",
+                "103": "Name:\tkvm-nx-lpage-recovery\nKthread:\t0\n",
+                "104": "Name:\tkvm-nx-lpage-recovery\n",
+            }.items():
+                (proc / pid).mkdir()
+                (proc / pid / "status").write_text(status)
+            self.assertEqual(runner_lifecycle.userspace_members(["101", "102"], proc), ["101"])
+            # Extra userspace tasks cannot hide behind a kernel-worker name,
+            # and older status formats without Kthread retain the old check.
+            self.assertEqual(runner_lifecycle.userspace_members(["101", "102", "103", "104"], proc),
+                             ["101", "103", "104"])
+
+    def test_missing_member_identity_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(FileNotFoundError):
+                runner_lifecycle.userspace_members(["101"], Path(directory))
+
     def observed(self, pid=101):
         return {"sid":"test-run", "run_id":"sr-old", "unit":"test@sr-old.service", "cgroup":"/test@sr-old.service",
                 "processes":{role:dict(pid=pid,ppid=1,start_ticks=1,cgroup="/unit/"+role,executable=role)

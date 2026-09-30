@@ -45,6 +45,19 @@ def same_process(first, second):
     return all(first[key] == second[key] for key in ("pid", "ppid", "start_ticks", "cgroup", "executable"))
 
 
+def userspace_members(members, proc_root=Path("/proc")):
+    # KVM may place its nx-lpage-recovery kernel worker in the VMM leaf.
+    # It is not another userspace VMM and has no exe link. Use the kernel's
+    # task flag, never a name exemption; assert_dead still requires removal
+    # of the complete delegated cgroup, including these workers.
+    result = []
+    for pid in members:
+        status = (proc_root / pid / "status").read_text()
+        if not any(line.split() == ["Kthread:", "1"] for line in status.splitlines()):
+            result.append(pid)
+    return result
+
+
 def snapshot(work, sid, prefix):
     state = row(work, sid)
     rid = state["run_id"]
@@ -65,9 +78,21 @@ def snapshot(work, sid, prefix):
     runtime_pid = int((run_dir / (sid + ".pid")).read_text())
     if parent_pid != int(props["MainPID"]) or parent_pid == runtime_pid:
         raise ValueError("resident parent and runtime PID identities are not distinct")
-    members = (Path("/sys/fs/cgroup") / cgroup.lstrip("/") / "vmm/cgroup.procs").read_text().split()
+    members = userspace_members((Path("/sys/fs/cgroup") / cgroup.lstrip("/") / "vmm/cgroup.procs").read_text().split())
     if len(members) != 1:
-        raise ValueError("VMM leaf must contain exactly the current CH process")
+        identities = []
+        for pid in members[:16]:
+            try:
+                identities.append(process(int(pid)))
+            except (OSError, ValueError):
+                details = {"pid": pid}
+                try:
+                    details["status"] = [line for line in (Path("/proc") / pid / "status").read_text().splitlines()
+                                         if line.startswith(("Name:", "State:", "Tgid:", "Pid:", "PPid:", "Kthread:"))]
+                except OSError:
+                    details["status"] = "absent"
+                identities.append(details)
+        raise ValueError("VMM leaf must contain exactly the current CH process: " + repr(identities))
     identities = dict(parent=process(parent_pid), runtime=process(runtime_pid), ch=process(int(members[0])))
     if identities["parent"]["executable"] != "node-ctl" or identities["runtime"]["executable"] != "sandbox-ctl":
         raise ValueError("unexpected runner/runtime executable")
@@ -132,6 +157,33 @@ def assert_dead(work, observed):
             raise ValueError("automatic cleanup left an original unit process alive")
 
 
+def cleanup_diagnostics(work, observed):
+    """Bounded ownership facts only; never argv, environment, or credentials."""
+    state = row(work, observed["sid"])
+    result = {"sid": observed["sid"], "run_id": observed["run_id"],
+              "state": state["state"], "processes": {}, "cgroups": {}}
+    for role, expected in observed["processes"].items():
+        try:
+            result["processes"][role] = process(expected["pid"])
+        except (OSError, ValueError):
+            result["processes"][role] = "absent or exited"
+    root = Path("/sys/fs/cgroup") / observed["cgroup"].lstrip("/")
+    for path in (root, root / "ctl", root / "vmm"):
+        fields = {}
+        for name in ("cgroup.events", "cgroup.procs", "cgroup.threads", "memory.current", "memory.events"):
+            try:
+                fields[name] = (path / name).read_text()[:4096]
+            except OSError:
+                fields[name] = "absent"
+        result["cgroups"][str(path)] = fields
+    result["unit"] = subprocess.run(
+        ["systemctl", "show", observed["unit"],
+         "--property=ActiveState,SubState,Result,ControlGroup,MainPID,TasksCurrent"],
+        text=True, capture_output=True, timeout=5, check=False,
+    ).stdout[:4096]
+    print("runner cleanup diagnostics " + json.dumps(result, sort_keys=True), flush=True)
+
+
 def kill_exact(work, observed, prefix, role):
     expected = observed["processes"][role]
     fd = os.pidfd_open(expected["pid"])
@@ -152,6 +204,7 @@ def main():
     parser.add_argument("unit_prefix")
     parser.add_argument("evidence", type=Path)
     parser.add_argument("--role", choices=("parent", "runtime", "ch"))
+    parser.add_argument("--diagnostics", action="store_true")
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,56}", args.sid) or not args.unit_prefix.endswith("@"):
         parser.error("invalid test sandbox or unit prefix")
@@ -163,7 +216,12 @@ def main():
     if observed["sid"] != args.sid or observed["unit"] != args.unit_prefix + observed["run_id"] + ".service":
         raise ValueError("evidence belongs to another execution")
     if args.operation == "dead":
-        assert_dead(work, observed)
+        try:
+            assert_dead(work, observed)
+        except ValueError:
+            if args.diagnostics:
+                cleanup_diagnostics(work, observed)
+            raise
     elif args.operation == "lease":
         verify_lease(work, observed)
     elif args.operation == "same-run":

@@ -125,7 +125,7 @@ PY_DIAG
             python3 -c 'import json,sys; v=json.load(sys.stdin); print(json.dumps({"memory_actual_size":v.get("memory_actual_size"), "balloon":v.get("config",{}).get("balloon")}))'
         echo "==> guest/controller journal sid=$sid"
         timeout 5 journalctl "KUASAR_SANDBOX_ID=$sid" --no-pager -n 200 -o cat |
-            grep -E 'memory:|mem_report|sensor:|BudgetAtSnapshot|workload|Cloud Hypervisor|runtime.*(ready|exit)|admit rejected' | tail -80
+            grep -E 'memory:|mem_report|sensor:|BudgetAtSnapshot|workload|Cloud Hypervisor|runtime.*(ready|exit)|admit rejected|exec: open guest session:|reverse-channel: (restore|attach|quiesce)' | tail -100
     done
     echo "==> conductor pressure/settlement events"
     grep -E 'node pressure|resource controller listening|grant .*sid=|settled .*sid=|inventory' "$WORK/orch-pressure.log" |

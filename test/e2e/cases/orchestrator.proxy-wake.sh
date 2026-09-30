@@ -53,11 +53,16 @@ python3 - "$WORK/config.yaml" <<'PY_CONFIG'
 from pathlib import Path
 import sys
 path = Path(sys.argv[1]); text = path.read_text()
-text = text.replace("physical_memory: auto", "physical_memory: 1536MiB", 1)
+# P=1GiB fits either full-capacity Snapshot, while both held workloads plus
+# their real headroom cannot run together. No workload size enters node policy.
+text = text.replace("physical_memory: auto", "physical_memory: 1792MiB", 1)
 text = text.replace("host_reserved: { memory: 1GiB, cpu: 0.5 }", "host_reserved: { memory: 512MiB, cpu: 0.5 }", 1)
 needle = "  admission: { rate: 50,"
 assert text.count(needle) == 1
-text = text.replace(needle, """  watermarks: { low_factor: 0.70, high_factor: 0.85, emergency_factor: 0.05, operational_margin_factor: 0.125, startup_factor: 0.40 }
+text = text.replace(needle, """  watermarks: { low_factor: 0.70, high_factor: 0.85, emergency_factor: 0.05, operational_margin_factor: 0.20, startup_factor: 0.40 }
+  # This deliberately small pool must exercise memory shortage, not the
+  # independent normal-grow rate limiter's one-second bucket.
+  rate_limits: { memory_grant_per_sec_factor: 1.0 }
   pressure: { interval: 2s, failure_interval: 500ms, critical_after_rounds: 3, pause_after_rounds: 3, critical_exit_hold: 5s, red_to_yellow_hold: 5s, yellow_to_green_hold: 5s, minimum_run_time: 2s }
 """ + needle, 1)
 path.write_text(text)
@@ -69,6 +74,197 @@ wait_proxy_topology_ready "$PROXY_MASTER_PID"
 
 pressure_status() {
     "$BIN/node-ctl" resource pressure --socket "$WORK/node-ctl.socket" > "$WORK/pressure-status.json"
+}
+pressure_diagnostics() (
+    # Best-effort, bounded diagnostics preserve the original assertion/exit.
+    # Project explicit nonsecret fields: never print API credentials, full
+    # sandbox metadata, resource tokens, or the whole conductor configuration.
+    set +e
+    echo "==> pressure failure diagnostics"
+    timeout 5 "$BIN/node-ctl" resource pressure --socket "$WORK/node-ctl.socket"
+    timeout 5 "$BIN/node-ctl" resource status --socket "$WORK/sandbox-resource.sock"
+    timeout 5 "$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" |
+        python3 -c '
+import json, pathlib, sys
+fields = ("sandbox_id", "peer_pid", "cgroup_path", "capacity", "floor", "allocatable_memory", "effective_startup_bytes", "stage", "last_report_unix", "current_rss", "connected", "provisional", "startup_expired")
+for row in json.load(sys.stdin) or []:
+    out = {key: row[key] for key in fields if key in row}
+    pid = row.get("peer_pid", 0)
+    try:
+        out["process_status"] = [line for line in pathlib.Path(f"/proc/{pid}/status").read_text().splitlines() if line.split(":", 1)[0] in ("Name", "State", "Pid", "PPid", "VmRSS", "RssAnon", "VmSwap")]
+    except OSError:
+        out["process_status"] = "absent"
+    cg = pathlib.Path("/sys/fs/cgroup") / row.get("cgroup_path", "").removeprefix("/sys/fs/cgroup/").lstrip("/")
+    for name in ("memory.current", "memory.high", "memory.max", "memory.events", "memory.stat", "cgroup.events"):
+        try: out[name] = (cg / name).read_text().strip()
+        except OSError: out[name] = "absent"
+    print(json.dumps(out, sort_keys=True))
+'
+    python3 - "$WORK" <<'PY_DIAG'
+from pathlib import Path
+import json, sys, yaml
+work = Path(sys.argv[1]); section = False
+for line in (work / "config.yaml").read_text().splitlines():
+    if line == "resource_listen:": section = True
+    elif line and not line[0].isspace(): section = False
+    if section: print(line)
+for path in (work / "run/sandboxes").glob("*/*.yaml"):
+    config = yaml.safe_load(path.read_text()); resource = config.get("resources", {})
+    projection = {key: resource.get(key) for key in ("capacity", "allocatable", "startup", "overhead", "watermark_high")}
+    projection["controller"] = resource.get("control", {}).get("controller")
+    print("runtime resource config", path.parent.name, json.dumps(projection))
+for name in ("pause-barrier-target", "pause-barrier-reached", "pause-barrier-release", "snapshot-argv.jsonl"):
+    path = work / name
+    print(name, "present" if path.exists() else "absent")
+PY_DIAG
+    for sid in "${FIRST:-}" "${SECOND:-}" "${PRESSURE_SID:-}"; do
+        [ -n "$sid" ] || continue
+        echo "==> guest memory/state sid=$sid"
+        timeout 5 "$BIN/sandbox-ctl" exec --run-root "$WORK/run/sandboxes" --sandbox-id "$sid" -- /bin/cat /proc/meminfo /tmp/pressure-state.json
+        timeout 5 curl -fsS --unix-socket "$WORK/run/sandboxes/$sid/ch.sock" http://localhost/api/v1/vm.info |
+            python3 -c 'import json,sys; v=json.load(sys.stdin); print(json.dumps({"memory_actual_size":v.get("memory_actual_size"), "balloon":v.get("config",{}).get("balloon")}))'
+        echo "==> guest/controller journal sid=$sid"
+        timeout 5 journalctl "KUASAR_SANDBOX_ID=$sid" --no-pager -n 200 -o cat |
+            grep -E 'memory:|mem_report|sensor:|BudgetAtSnapshot|workload|Cloud Hypervisor|runtime.*(ready|exit)|admit rejected' | tail -80
+    done
+    echo "==> conductor pressure/settlement events"
+    grep -E 'node pressure|resource controller listening|grant .*sid=|settled .*sid=|inventory' "$WORK/orch-pressure.log" |
+        sed -E 's/(grant|settled|admit) [[:xdigit:]]+ sid=/\1 [redacted] sid=/g' | tail -100
+    [ ! -f "$WORK/pressure-timeline.log" ] || tail -20 "$WORK/pressure-timeline.log"
+    return 0
+)
+fail() {
+    pressure_diagnostics > "$WORK/pressure-failure.log" 2>&1 || true
+    cat "$WORK/pressure-failure.log" >&2
+    echo "==> FAIL: $*" >&2
+    exit 1
+}
+pressure_cleanup() {
+    local result=$? sid
+    trap - EXIT
+    set +e
+    if [ "$result" != 0 ]; then
+        # Keep the conductor alive for normal detach before the shared helper
+        # stops processes. Abrupt failure with live guests otherwise leaves
+        # attached ports, correctly retaining the execute recovery record.
+        [ ! -e "$PAUSE_BARRIER_TARGET" ] || : > "$PAUSE_BARRIER_RELEASE"
+        timeout 2 "$BIN/node-ctl" resource drain --socket "$WORK/sandbox-resource.sock" >/dev/null 2>&1
+        for sid in "${FIRST:-}" "${SECOND:-}" "${PRESSURE_SID:-}"; do
+            [ -n "$sid" ] || continue
+            curl -sS --noproxy '*' --max-time 5 -o /dev/null -X DELETE \
+                -H "Host: api.$DOMAIN" -H "X-API-KEY: $AK" \
+                "http://127.0.0.1:$PORT/sandboxes/$sid" >/dev/null 2>&1
+        done
+        python3 - "$WORK/lib/node-ctl.db" "${FIRST:-}" "${SECOND:-}" "${PRESSURE_SID:-}" <<'PY_CLEANUP'
+import sqlite3, sys, time
+ids = set(sys.argv[2:]) - {""}; end = time.monotonic() + 20
+while ids and time.monotonic() < end:
+    with sqlite3.connect(sys.argv[1], timeout=1) as db:
+        ids.intersection_update(row[0] for row in db.execute("select id from sandboxes"))
+    if ids: time.sleep(.2)
+if ids: print("==> pressure cleanup still pending; ownership recovery guard will verify remaining resources")
+PY_CLEANUP
+    fi
+    cleanup
+    exit "$result"
+}
+trap pressure_cleanup EXIT
+pressure_memory_observation() {
+    # Observe real consumers and file cache without faulting Snapshot pages in,
+    # reclaiming host caches, or assuming when the other guest will grow.
+    python3 - "$BIN/node-ctl" "$WORK" "$FIRST" "$SECOND" "$1" <<'PY_RELEASE'
+import ctypes, json, os, subprocess, sys, time
+from pathlib import Path
+binary, directory, first, second, phase = sys.argv[1:]
+work = Path(directory)
+rows = json.loads(subprocess.check_output([binary, "resource", "list", "--socket", str(work / "sandbox-resource.sock")], timeout=5)) or []
+def start_ticks(pid):
+    try: return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+    except FileNotFoundError: return None
+def values(path):
+    return {key: int(value) for key, value in (line.split() for line in path.read_text().splitlines())}
+record = {"phase": phase, "at": time.time(), "guests": []}
+record["host_memory_kib"] = {key.rstrip(":"): int(value) for key, value, *_ in
+    (line.split() for line in Path("/proc/meminfo").read_text().splitlines())
+    if key.rstrip(":") in ("MemAvailable", "MemFree", "Cached", "Dirty", "Writeback")}
+for row in rows:
+    assert row["sandbox_id"] in (first, second), "unexpected resource consumer"
+    cg = Path(row["cgroup_path"])
+    vmm = []
+    for pid in (cg / "cgroup.procs").read_text().split():
+        try:
+            if Path(f"/proc/{pid}/exe").resolve().name == "cloud-hypervisor":
+                vmm.append({"pid": int(pid), "start_ticks": start_ticks(pid)})
+        except FileNotFoundError: pass
+    record["guests"].append({"sid": row["sandbox_id"], "reservation": row["allocatable_memory"],
+        "stage": row["stage"], "cgroup": str(cg), "vmm": vmm,
+        "memory_current": int((cg / "memory.current").read_text()), "memory_stat": values(cg / "memory.stat")})
+if phase == "before":
+    old = next(row for row in record["guests"] if row["sid"] == first)
+    assert old["stage"] == "settled" and old["vmm"] and old["memory_current"] > 0 and old["reservation"] > 0, old
+else:
+    before = json.loads((work / "pressure-memory-before.json").read_text())
+    old = next(row for row in before["guests"] if row["sid"] == first)
+    assert all(row["sid"] != first for row in record["guests"]), "old reservation still charged"
+    for proc in old["vmm"]:
+        assert start_ticks(proc["pid"]) != proc["start_ticks"], "old VMM still alive"
+    cg = Path(old["cgroup"])
+    assert not cg.exists() or values(cg / "cgroup.events")["populated"] == 0, "old consumer cgroup still populated"
+    record["released_vmm_memory_current"] = old["memory_current"]
+    # mincore only inspects residency; PROT_NONE mappings do not read/fault data.
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+    libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+    libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    page = os.sysconf("SC_PAGE_SIZE"); seen = set(); files = []
+    for path in (work / "lib/sandboxes" / first / "checkpoint").rglob("*"):
+        if not path.is_file(): continue
+        stat = path.stat(); identity = (stat.st_dev, stat.st_ino)
+        if identity in seen: continue
+        seen.add(identity); resident = 0
+        if stat.st_size:
+            with path.open("rb") as source:
+                address = libc.mmap(None, stat.st_size, 0, 1, source.fileno(), 0)
+                assert address != ctypes.c_void_p(-1).value, ctypes.get_errno()
+                try:
+                    vector = (ctypes.c_ubyte * ((stat.st_size + page - 1) // page))()
+                    assert libc.mincore(address, stat.st_size, vector) == 0, ctypes.get_errno()
+                    resident = sum(value & 1 for value in vector) * page
+                finally: assert libc.munmap(address, stat.st_size) == 0
+        files.append({"bytes": stat.st_size, "allocated_bytes": stat.st_blocks * 512, "resident_cache_bytes": resident})
+    assert files, "no saved Snapshot files"
+    record["checkpoint_files"] = files
+(work / f"pressure-memory-{phase}.json").write_text(json.dumps(record, sort_keys=True))
+print("==> physical memory observation " + json.dumps(record, sort_keys=True))
+PY_RELEASE
+}
+pressure_wait_parking() {
+    # These are bare guests: only forward and native exec are registered.
+    # The general E2B helper requires envd/code-interpreter service entries.
+    local code
+    for _ in $(seq 1 100); do
+        code=$(req GET "/sandboxes/$FIRST/stats/traffic" "$AK")
+        pressure_status
+        if [ "$code" = 200 ] && python3 - "$WORK/resp.body" "$WORK/pressure-status.json" "$FIRST" <<'PY_PARKED'
+import json, sys
+stats, pressure = [json.load(open(path)) for path in sys.argv[1:3]]
+row = next(row for row in pressure["sandboxes"] if row["sandbox_id"] == sys.argv[3])
+services = stats.get("services", {})
+assert set(services) == {"forward", "exec"}, stats
+assert set(stats["inflight"]) == {"parking", "connected"}, stats
+assert all(set(item) >= {"parking", "connected"} for item in services.values()), stats
+ok = (pressure["zone"] == "critical" and row["state"] == "paused" and
+      row["pause_reason"] == "explicit" and not row["recovery_obligation"] and
+      stats["state"] == "paused" and stats["inflight"]["parking"] >= 1 and
+      services["exec"]["parking"] >= 1 and "idleSince" not in stats)
+if ok: print("==> ordinary critical Wake remains paused with native exec parked")
+raise SystemExit(0 if ok else 1)
+PY_PARKED
+        then return 0; fi
+        sleep .05
+    done
+    return 1
 }
 pressure_create() { # primary workload, no dependence on a surviving exec
     local amount="$1" body
@@ -100,21 +296,57 @@ for _ in $(seq 1 300); do
     sleep 0.1
 done
 [ -n "$ready" ] || fail "first held-memory workload did not become ready"
+# Heap allocation can finish through balloon self-deflation before its node
+# Budget catches up. Establish a satisfied, eligible oldest consumer first;
+# otherwise it is legitimately the beneficiary and the newer guest is paused.
+python3 - "$BIN" "$WORK" "$FIRST" <<'PY_SATISFIED' || fail "first held workload did not obtain its real Budget/headroom"
+import json, subprocess, sys, time
+from pathlib import Path
+binary, directory, sid = sys.argv[1:]; work = Path(directory)
+end = time.monotonic() + 40
+last = None
+while time.monotonic() < end:
+    rows = json.loads(subprocess.check_output([binary + "/node-ctl", "resource", "list", "--socket", str(work / "sandbox-resource.sock")], timeout=5)) or []
+    row = next(r for r in rows if r["sandbox_id"] == sid)
+    info = json.loads(subprocess.check_output(["curl", "-fsS", "--max-time", "2", "--unix-socket", str(work / "run/sandboxes" / sid / "ch.sock"), "http://localhost/api/v1/vm.info"], timeout=3))
+    mem = subprocess.check_output([binary + "/sandbox-ctl", "exec", "--run-root", str(work / "run/sandboxes"), "--sandbox-id", sid, "--", "/bin/cat", "/proc/meminfo"], timeout=5).decode()
+    available = next(int(line.split()[1]) * 1024 for line in mem.splitlines() if line.startswith("MemAvailable:"))
+    last = dict(reservation=row["allocatable_memory"], actual=info["memory_actual_size"], target_budget=(1<<30)-info["config"]["balloon"]["size"], available=available, stage=row["stage"])
+    # Actual can remain above target after guest self-deflation. The existing
+    # local policy grows for demand + headroom, not actual/target equality.
+    required = max(last["target_budget"], last["actual"] - available + 64*(1<<20))
+    if last["stage"] == "settled" and last["reservation"] >= required and last["actual"] >= 384*(1<<20) and available >= 64*(1<<20):
+        print("==> oldest workload has observed Budget/headroom", json.dumps(last))
+        break
+    time.sleep(.5)
+else:
+    raise AssertionError(last)
+PY_SATISFIED
 # Hold the existing capture boundary to observe Q before any memory is released.
 printf '%s\n' "$FIRST" > "$PAUSE_BARRIER_TARGET"
 rm -f "$PAUSE_BARRIER_REACHED" "$PAUSE_BARRIER_RELEASE"
 pressure_create 576
 SECOND=$PRESSURE_SID
 "$BIN/sandbox-ctl" exec --run-root "$WORK/run/sandboxes" --sandbox-id "$SECOND" -- /bin/touch /tmp/pressure.start
-for _ in $(seq 1 600); do [ ! -e "$PAUSE_BARRIER_REACHED" ] || break; sleep 0.1; done
+pressure_deadline=$((SECONDS + 60))
+pressure_next_sample=$SECONDS
+while [ ! -e "$PAUSE_BARRIER_REACHED" ] && [ "$SECONDS" -lt "$pressure_deadline" ]; do
+    if [ "$SECONDS" -ge "$pressure_next_sample" ]; then
+        timeout 2 "$BIN/node-ctl" resource pressure --socket "$WORK/node-ctl.socket" |
+            python3 -c 'import json,sys,time; print(json.dumps(dict(at=time.time(), pressure=json.load(sys.stdin))))' >> "$WORK/pressure-timeline.log" || true
+        pressure_next_sample=$((SECONDS + 2))
+    fi
+    sleep 0.1
+done
 [ -e "$PAUSE_BARRIER_REACHED" ] || fail "sustained demand did not select the longest running guest"
 pressure_status
-python3 - "$WORK/pressure-status.json" <<'PY_CAPTURE'
+python3 - "$WORK/pressure-status.json" <<'PY_CAPTURE' || fail "capture obligation accounting"
 import json, sys
 p=json.load(open(sys.argv[1]))
 assert p["zone"] == "critical" and p["capturing"] == 1 and p["pending_recoveries"] == 1, p
 assert p["reserved_memory"] > 0, p
 PY_CAPTURE
+pressure_memory_observation before || fail "live pressure consumer observation failed"
 # Drain only this test controller while capture is already accepted, so slow
 # cleanup cannot let automatic recovery win the adoption assertion.
 "$BIN/node-ctl" resource drain --socket "$WORK/sandbox-resource.sock" >/dev/null
@@ -126,13 +358,14 @@ SNAPSHOT_PAIR=$(checkpoint_pair "$FIRST" snapshot "$WORK/lib/sandboxes/$FIRST/ch
 code=$(req POST "/sandboxes/$FIRST/pause" "$AK")
 [ "$code" = 204 ] || fail "resource Pause adoption=$code"
 pressure_status
-python3 - "$WORK/pressure-status.json" "$FIRST" <<'PY_ADOPT'
+python3 - "$WORK/pressure-status.json" "$FIRST" <<'PY_ADOPT' || fail "adoption obligation accounting"
 import json, sys
 p=json.load(open(sys.argv[1])); row=next(r for r in p["sandboxes"] if r["sandbox_id"]==sys.argv[2])
 assert p["zone"]=="critical" and p["pending_recoveries"]==0, p
 assert row["state"]=="paused" and row["pause_reason"]=="explicit" and not row["recovery_obligation"], row
 PY_ADOPT
 wait_paused_cleanup "$FIRST" 600 || fail "resource Pause cleanup incomplete"
+pressure_memory_observation after || fail "resource Pause did not release the old physical consumer"
 [ "$(checkpoint_pair "$FIRST" snapshot "$WORK/lib/sandboxes/$FIRST/checkpoint/$FIRST.snapshot")" = "$SNAPSHOT_PAIR" ] || fail "adoption changed Snapshot source"
 "$BIN/node-ctl" resource drain --disable --socket "$WORK/sandbox-resource.sock" >/dev/null
 code=$(req POST "/sandboxes/$FIRST/pause" "$AK")
@@ -142,7 +375,7 @@ code=$(req POST "/sandboxes/$FIRST/pause" "$AK")
 exec_through_proxy_connect "$FIRST" "$FIRST_KAT" "PRESSURE_RESTORED_$RANDOM" 1 100 &
 PRESSURE_EXEC_PID=$!
 PIDS+=("$PRESSURE_EXEC_PID")
-wait_proxy_traffic_stats "$FIRST" parking || fail "ordinary critical request did not park"
+pressure_wait_parking || fail "ordinary critical request did not park"
 code=$(req POST "/sandboxes/$SECOND/pause" "$AK")
 [ "$code" = 204 ] || fail "second explicit Pause=$code"
 wait "$PRESSURE_EXEC_PID" || fail "parked Proxy Wake did not recover adopted Snapshot"
@@ -164,13 +397,85 @@ done
 # The saved baseline exceeds the ordinary startup pool; runtime admission must
 # have restored the full Snapshot budget through the serialized saved lane.
 grep -Eq 'restore BudgetAtSnapshot reserved=' "$WORK/orch-pressure.log" ||     journalctl KUASAR_SANDBOX_ID="$FIRST" --no-pager -o cat > "$WORK/pressure-restore.journal"
-python3 - "$WORK/orch-pressure.log" "$WORK/pressure-restore.journal" <<'PY_BUDGET'
+python3 - "$WORK/orch-pressure.log" "$WORK/pressure-restore.journal" "$WORK/pressure-status.json" <<'PY_BUDGET' || fail "complete Snapshot budget admission"
 import re, sys
 from pathlib import Path
-text="\n".join(Path(p).read_text() for p in sys.argv[1:] if Path(p).exists())
+text="\n".join(Path(p).read_text() for p in sys.argv[1:3] if Path(p).exists())
 budgets=[int(n) for n in re.findall(r'restore BudgetAtSnapshot reserved=(\d+)',text)]
-assert any(n>int(896*(1<<20)*.4) and n<=896*(1<<20) for n in budgets), budgets
+pool=__import__("json").load(open(sys.argv[3]))["pool_memory"]
+assert any(int(pool*.4)<n<=pool for n in budgets), budgets
 PY_BUDGET
+# ---- unattended mixed-workload rotation ---------------------------------
+# Re-enable the second saved workload once, then send no more Wake/Connect.
+# Read-only native exec probes below cannot launch a paused sandbox.
+allowed=""
+for _ in $(seq 1 100); do
+    pressure_status
+    if python3 - "$WORK/pressure-status.json" <<'PY_ORDINARY'
+import json, sys
+raise SystemExit(0 if json.load(open(sys.argv[1]))["zone"] != "critical" else 1)
+PY_ORDINARY
+    then allowed=1; break; fi
+    sleep .1
+done
+[ -n "$allowed" ] || fail "ordinary recovery never became eligible after relief"
+curl -sS --noproxy '*' --max-time 120 -o "$WORK/pressure-connect.body" -w '%{http_code}' \
+    -X POST -H "Host: api.$DOMAIN" -H "X-API-KEY: $AK" -H 'Content-Type: application/json' \
+    --data '{"timeout":600}' "http://127.0.0.1:$PORT/sandboxes/$SECOND/connect" > "$WORK/pressure-connect.code" &
+PRESSURE_CONNECT_PID=$!
+PIDS+=("$PRESSURE_CONNECT_PID")
+python3 - "$BIN" "$WORK" "$FIRST" "$SECOND" <<'PY_ROTATION' || fail "unattended pressure rotation did not preserve both primary workloads"
+import json, sqlite3, subprocess, sys, time
+from pathlib import Path
+binary, directory, first, second = sys.argv[1:]; work = Path(directory)
+ids = (first, second); seen = {sid: {} for sid in ids}; running_since = {}
+expected = {first: json.loads((work / "pressure-before.json").read_text())["nonce"]}
+start = time.monotonic(); deadline = start + 180; last = None
+with (work / "pressure-rotation.log").open("w") as output:
+    while time.monotonic() < deadline:
+        p = json.loads(subprocess.check_output([binary + "/node-ctl", "resource", "pressure", "--socket", str(work / "node-ctl.socket")], timeout=5))
+        assert p["reserved_memory"] <= p["pool_memory"], p
+        if p["pending_recoveries"]:
+            assert p["zone"] == "critical", p
+        with sqlite3.connect((work / "lib/node-ctl.db").resolve().as_uri() + "?mode=ro", uri=True, timeout=2) as db:
+            rows = db.execute("select id,state,run_id,running_since_ns from sandboxes where id in (?,?)", ids).fetchall()
+        assert len(rows) == 2 and all(row[1] in ("running", "paused", "starting") for row in rows), rows
+        output.write(json.dumps(dict(at=time.time(), pressure=p, lifecycle=rows)) + "\n"); output.flush()
+        for sid, state, run_id, since in rows:
+            if state != "running": continue
+            if run_id not in running_since:
+                assert since > max((stamp for rid, stamp in running_since.items() if rid in seen[sid]), default=0), (sid, since, running_since)
+                running_since[run_id] = since
+            try:
+                result = subprocess.run([binary + "/sandbox-ctl", "exec", "--run-root", str(work / "run/sandboxes"), "--sandbox-id", sid, "--", "/bin/cat", "/tmp/pressure-state.json"], capture_output=True, timeout=3)
+                if result.returncode: continue  # capture can win this read-only probe
+                held = json.loads(result.stdout)
+            except (subprocess.TimeoutExpired, json.JSONDecodeError): continue
+            assert held["held"] == (384 if sid == first else 576)*(1<<20), held
+            assert held["nonce"] == expected.setdefault(sid, held["nonce"]), (sid, held)
+            old = seen[sid].get(run_id)
+            assert held["tick"] >= max((value["last"] for value in seen[sid].values()), default=0), (sid, held, seen[sid])
+            if old is None:
+                seen[sid][run_id] = dict(first=held["tick"], last=held["tick"])
+            else:
+                old["last"] = held["tick"]
+            if old is None: print("==> warm primary observed", sid, run_id, held["held"], held["tick"], flush=True)
+        last = {sid: sum(value["last"] > value["first"] for value in runs.values()) for sid, runs in seen.items()}
+        # Observe sustained contention for at least a minute, including at least
+        # two distinct warm runs per workload without another external Wake.
+        if time.monotonic()-start >= 60 and all(count >= 2 for count in last.values()): break
+        time.sleep(.5)
+    else:
+        raise AssertionError(dict(warm_runs=last, pressure=p))
+(work / "pressure-rotation-result.json").write_text(json.dumps(dict(warm_runs=seen, seconds=time.monotonic()-start)))
+print("==> unattended mixed-workload rotation passed", json.dumps(last))
+PY_ROTATION
+wait "$PRESSURE_CONNECT_PID" || fail "second ordinary Connect transport failed"
+[ "$(cat "$WORK/pressure-connect.code")" = 200 ] || fail "second ordinary Connect response"
+for i in "${!PIDS[@]}"; do [ "${PIDS[$i]}" != "$PRESSURE_CONNECT_PID" ] || PIDS[$i]=""; done
+# Stop new background acceptance while the existing normal Delete path drains
+# every owned consumer and obligation. This does not certify ambiguous cleanup.
+"$BIN/node-ctl" resource drain --socket "$WORK/sandbox-resource.sock" >/dev/null
 for sid in "$FIRST" "$SECOND"; do
     code=$(req DELETE "/sandboxes/$sid" "$AK"); [ "$code" = 204 ] || fail "pressure delete=$code"
     wait_sandbox_state "$sid" missing 600 || fail "pressure delete finalization"

@@ -107,6 +107,85 @@ func TestPressureDistinctFailureRounds(t *testing.T) {
 	}
 }
 
+// Guest reports arrive every five seconds. A more frequent pressure scan (or
+// admin observer) must not erase a live waiter's history between valid retries.
+func TestPressureGuestReportCadenceSurvivesObservation(t *testing.T) {
+	const mib = uint64(1 << 20)
+	s := NewState(896*mib, 1000, 0, 0, Watermarks{LowFactor: .7, HighFactor: .85, EmergencyFactor: .05, StartupFactor: .4})
+	now := time.Now()
+	s.initPressureLocked()
+	s.pressure.clock = func() time.Time { return now }
+	policy := DefaultPressurePolicy()
+	policy.Interval = 2 * time.Second
+	if err := s.ConfigurePressure(policy, PressureRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	installReservationForTest(t, s, Reservation{SandboxID: "oldest", Token: "oldest", Capacity: Resources{MemoryBytes: 1024 * mib}, ReservationMemory: 512 * mib, Stage: StageSettled})
+	installReservationForTest(t, s, Reservation{SandboxID: "waiter", Token: "waiter", Capacity: Resources{MemoryBytes: 1024 * mib}, ReservationMemory: 320 * mib, Stage: StageSettled})
+	allocator := NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: 1024 * mib, MinGrantStep: 64 * mib, MaxGrantStep: 64 * mib})
+	for report := 0; report < policy.CriticalAfterRounds+policy.PauseAfterRounds; report++ {
+		if report != 0 {
+			for scan := 0; scan < 5; scan++ {
+				now = now.Add(time.Second)
+				_ = s.PressureSnapshot()
+			}
+		}
+		got, found, err := s.ReconcileAndGrant("waiter", 320*mib, 64*mib, UrgencyNormal, allocator)
+		if err != nil || !found || got.Decision.GrantedDelta != 0 {
+			t.Fatalf("report %d: expected a valid headroom wait: %+v, %v", report, got, err)
+		}
+	}
+	if p := s.PressureSnapshot(); p.Zone != ZoneCritical || !p.PauseEligible || p.Beneficiary != "waiter" {
+		t.Fatalf("five-second retries lost their pressure history: %+v", p)
+	}
+	status := s.PressureSnapshot()
+	if len(status.Demands) != 1 || status.Demands[0].Kind != "grow" || status.Demands[0].SandboxID != "waiter" || status.Demands[0].Rounds != 6 || status.Demands[0].CriticalRounds != 3 || status.Demands[0].LastAttemptAgo != 0 {
+		t.Fatalf("pressure diagnostic lost the valid demand: %+v", status.Demands)
+	}
+	if !s.BeginPressurePause("oldest", 1) {
+		t.Fatal("sustained valid guest demand did not authorize the settled victim")
+	}
+}
+
+func TestPressureExpiredDemandCannotPauseOrCarryFailureRounds(t *testing.T) {
+	s, now := pressureTestState(t)
+	installReservationForTest(t, s, Reservation{SandboxID: "existing", Token: "existing", Capacity: Resources{MemoryBytes: 1000}, ReservationMemory: 600, Stage: StageSettled})
+	a := LaunchAdmission{Operation: OperationResume, Identity: "run-1", Accepted: true}
+	for i := 0; i < 6; i++ {
+		s.RecordAdmissionWait("resume", a, 500)
+		*now = now.Add(500 * time.Millisecond)
+	}
+	if !s.PressureSnapshot().PauseEligible {
+		t.Fatal("fixture did not establish sustained demand")
+	}
+	*now = now.Add(31 * time.Second)
+	// No snapshot/periodic scan intervenes: the operation itself must reject
+	// stale Pause authority and restart the later real request's rounds.
+	if s.BeginPressurePause("existing", 1) {
+		t.Fatal("expired demand authorized a Pause")
+	}
+	s.RecordAdmissionWait("resume", a, 500)
+	if p := s.PressureSnapshot(); p.PauseEligible || p.Pending != 0 || p.ReservedMemory != 600 {
+		t.Fatalf("stale failure rounds survived the gap: %+v", p)
+	}
+}
+
+func TestPressureExpiredProtectionDoesNotNeedObserver(t *testing.T) {
+	s, now := pressureTestState(t)
+	installReservationForTest(t, s, Reservation{SandboxID: "existing", Token: "existing", Capacity: Resources{MemoryBytes: 1000}, ReservationMemory: 600, Stage: StageSettled})
+	s.RecordAdmissionWait("resume", LaunchAdmission{Operation: OperationResume, Identity: "run-1", Accepted: true}, 500)
+	if got := s.AnalyzeLaunch("other", 1, LaunchAdmission{}); got.Status != OutcomeShortTermBlock {
+		t.Fatalf("live resume funds were not protected: %+v", got)
+	}
+	*now = now.Add(31 * time.Second)
+	if got := s.AnalyzeLaunch("other", 1, LaunchAdmission{}); got.Status != OutcomeAdmitted {
+		t.Fatalf("unused expired protection blocked actual headroom: %+v", got)
+	}
+	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != 600 {
+		t.Fatalf("expiration changed charged memory: %d", got)
+	}
+}
+
 func TestSavedSourceCompleteBudgetAndSerialStartup(t *testing.T) {
 	for _, budget := range []uint64{400, 975} {
 		s, _ := pressureTestState(t)

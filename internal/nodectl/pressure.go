@@ -2,6 +2,8 @@ package nodectl
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -85,18 +87,31 @@ type PressureSnapshot struct {
 	ReservedMemory  uint64 `json:"reserved_memory"`
 	EmergencyMemory uint64 `json:"emergency_memory"`
 	PressureRecord
-	RawZone       Zone          `json:"raw_zone"`
-	Pending       int           `json:"pending_recoveries"`
-	Capturing     int           `json:"capturing"`
-	Paused        int           `json:"paused"`
-	Starting      int           `json:"starting"`
-	Cleanup       int           `json:"pending_cleanup"`
-	Protected     uint64        `json:"protected_memory"`
-	Beneficiary   string        `json:"beneficiary,omitempty"`
-	Blocked       string        `json:"blocked,omitempty"`
-	OldestWait    time.Duration `json:"oldest_wait"`
-	HoldRemaining time.Duration `json:"hold_remaining"`
-	PauseEligible bool          `json:"pause_eligible"`
+	RawZone       Zone                   `json:"raw_zone"`
+	Pending       int                    `json:"pending_recoveries"`
+	Capturing     int                    `json:"capturing"`
+	Paused        int                    `json:"paused"`
+	Starting      int                    `json:"starting"`
+	Cleanup       int                    `json:"pending_cleanup"`
+	Protected     uint64                 `json:"protected_memory"`
+	Beneficiary   string                 `json:"beneficiary,omitempty"`
+	Blocked       string                 `json:"blocked,omitempty"`
+	OldestWait    time.Duration          `json:"oldest_wait"`
+	HoldRemaining time.Duration          `json:"hold_remaining"`
+	PauseEligible bool                   `json:"pause_eligible"`
+	Demands       []PressureDemandStatus `json:"demands,omitempty"`
+}
+
+// PressureDemandStatus exposes only nonsecret wait facts, never the token or
+// launch authority used to fence the demand. The underlying demand set is bounded.
+type PressureDemandStatus struct {
+	SandboxID       string        `json:"sandbox_id,omitempty"`
+	Kind            string        `json:"kind"`
+	RequestedMemory uint64        `json:"requested_memory"`
+	MemoryBlocked   bool          `json:"memory_blocked"`
+	Rounds          int           `json:"failure_rounds"`
+	CriticalRounds  int           `json:"critical_rounds"`
+	LastAttemptAgo  time.Duration `json:"last_attempt_ago"`
 }
 
 type pressureObligation struct {
@@ -121,6 +136,17 @@ type memoryDemand struct {
 	critical      int
 	recovery      bool
 	memoryBlocked bool
+}
+
+// Guest memory reports and RequestBudget retries have a cadence independent of
+// the node's pressure scan. Keep a bounded freshness window that covers their
+// five-second reporting/RPC budgets across several legitimate retries. A scan
+// or an admin observer must not erase a valid waiter before its next report.
+// Only another failed transaction advances its rounds.
+const minimumDemandFreshness = 30 * time.Second
+
+func (p *pressureState) demandFresh(d *memoryDemand, now time.Time) bool {
+	return d != nil && now.Sub(d.last) <= max(minimumDemandFreshness, 3*p.policy.FailureInterval, 2*p.policy.Interval)
 }
 
 type pressureState struct {
@@ -229,7 +255,7 @@ func (s *State) advancePressureLocked(now time.Time) {
 	// Demand validity is refreshed by real resource transactions or queued
 	// admission rechecks, not by the pressure timer fabricating failed RPCs.
 	for _, d := range p.demands {
-		if d.memoryBlocked && now.Sub(d.last) <= max(3*p.policy.FailureInterval, 2*p.policy.Interval) {
+		if d.memoryBlocked && p.demandFresh(d, now) {
 			p.holdSince = time.Time{}
 			return
 		}
@@ -346,7 +372,7 @@ func (s *State) failDemandLocked(key, sid, identity string, amount, baseline uin
 	s.initPressureLocked()
 	p := &s.pressure
 	d := p.demands[key]
-	if d != nil && d.identity != identity {
+	if d != nil && (d.identity != identity || !p.demandFresh(d, now)) {
 		s.clearDemandLocked(key)
 		d = nil
 	}
@@ -379,7 +405,7 @@ func (s *State) failDemandLocked(key, sid, identity string, amount, baseline uin
 	// Select one beneficiary. Recovery outranks grow; within a class the first
 	// valid waiter keeps its funds until progress or cancellation.
 	selected := p.demands[p.beneficiary]
-	if selected == nil || (recovery && !selected.recovery) {
+	if !p.demandFresh(selected, now) || (recovery && !selected.recovery) {
 		p.beneficiary = key
 	}
 	p.holdSince = time.Time{}
@@ -389,6 +415,10 @@ func (s *State) failDemandLocked(key, sid, identity string, amount, baseline uin
 func (s *State) protectedLocked(owner string) uint64 {
 	s.initPressureLocked()
 	if d := s.pressure.demands[s.pressure.beneficiary]; d != nil && s.pressure.beneficiary != owner {
+		if !s.pressure.demandFresh(d, s.pressure.clock()) {
+			s.clearDemandLocked(s.pressure.beneficiary)
+			return 0
+		}
 		return d.amount
 	}
 	return 0
@@ -449,7 +479,7 @@ func (s *State) PressureSnapshot() PressureSnapshot {
 	// Only periodic/diagnostic work scans this bounded demand set. Expiration
 	// drops an unused protection, never a reservation or durable obligation.
 	for key, d := range s.pressure.demands {
-		if now.Sub(d.last) > max(3*s.pressure.policy.FailureInterval, 2*s.pressure.policy.Interval) {
+		if !s.pressure.demandFresh(d, now) {
 			s.clearDemandLocked(key)
 		}
 	}
@@ -474,12 +504,20 @@ func (s *State) PressureSnapshot() PressureSnapshot {
 			out.Cleanup++
 		}
 	}
-	for _, d := range p.demands {
+	for key, d := range p.demands {
 		out.OldestWait = max(out.OldestWait, now.Sub(d.first))
+		kind, _, _ := strings.Cut(key, ":")
+		out.Demands = append(out.Demands, PressureDemandStatus{SandboxID: d.sid, Kind: kind, RequestedMemory: d.amount, MemoryBlocked: d.memoryBlocked, Rounds: d.rounds, CriticalRounds: d.critical, LastAttemptAgo: now.Sub(d.last)})
 		if p.record.Zone == ZoneCritical && d.critical >= p.policy.PauseAfterRounds {
 			out.PauseEligible = true
 		}
 	}
+	sort.Slice(out.Demands, func(i, j int) bool {
+		if out.Demands[i].SandboxID != out.Demands[j].SandboxID {
+			return out.Demands[i].SandboxID < out.Demands[j].SandboxID
+		}
+		return out.Demands[i].Kind < out.Demands[j].Kind
+	})
 	if d := p.demands[p.beneficiary]; d != nil {
 		out.Protected, out.Beneficiary, out.Blocked = d.amount, d.sid, "memory_headroom"
 		if !d.memoryBlocked {
@@ -596,7 +634,7 @@ func (s *State) BeginPressurePause(sid string, version uint64) bool {
 	}
 	eligible := false
 	for _, d := range s.pressure.demands {
-		if d.memoryBlocked && s.pressure.clock().Sub(d.last) <= max(3*s.pressure.policy.FailureInterval, 2*s.pressure.policy.Interval) && d.critical >= s.pressure.policy.PauseAfterRounds {
+		if d.memoryBlocked && s.pressure.demandFresh(d, s.pressure.clock()) && d.critical >= s.pressure.policy.PauseAfterRounds {
 			eligible = true
 		}
 	}

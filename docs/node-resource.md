@@ -279,7 +279,15 @@ impossible capacity, drain, transport failures, and startup-slot/rate-token
 waits do not count. Three qualified rounds enter critical; three further
 rounds authorize one Pause. Another Pause needs fresh rounds. Reservation
 increments smaller than sandboxer's executable MemoryStep do not erase a
-still-blocked demand. A host MemAvailable sample below OperationalMargin is
+still-blocked demand. Demand freshness is independent of polling: its bounded
+window is the maximum of 30 seconds, three failure intervals and two scan
+intervals. This retains the guest's
+five-second report/retry history; observations never add failure rounds.
+Expired history restarts on a later request, and unused expired protection
+cannot block admission even before the next scan. Expiration never clears a
+reservation or recovery obligation. The local pressure query includes each
+demand's nonsecret age, amount and failure/critical round counts.
+A host MemAvailable sample below OperationalMargin is
 a separate safety input; it neither changes R nor grants the reserved margin.
 
 Q includes accepted capture intent, resource-pressure paused rows and their
@@ -428,6 +436,13 @@ remove such an action to turn it into adoption. Ordinary repeated Pause still
 returns 409; starting still conflicts. A later real Wake follows ordinary
 resume rules, with no permanent user-paused lock. Adoption is not Release and
 cannot bypass the critical exit conditions.
+
+Physical release checks distinguish the old VMM's shared-memory charge from
+Snapshot file cache. After the old process exits, disk-backed Snapshot pages
+may remain cached or dirty; `MemFree` need not rise by the old charge. Observe
+the old process/cgroup identity, confirmed reservation release, host
+`MemAvailable` and storage writeback separately. The node never treats a
+Snapshot's file length or a predicted guest working set as released headroom.
 
 Sandbox fields and the small transition journal share the existing SQLite
 owner. The node restores them with resource inventory before serving. Resource

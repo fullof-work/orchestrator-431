@@ -308,6 +308,10 @@ yellow 不是节点拒绝 cluster-create 的模式。NodeList 不新增动态水
 不可能满足的容量、drain、传输错误以及单纯启动槽/token 等待不计入。
 缺省三轮进入 critical，再三轮授权一次 Pause；下一次 Pause 需要新轮次。
 不足以形成 sandboxer 可执行 MemoryStep 的小额 reservation grant，不会抹去仍阻塞的需求。
+需求有效期独立于轮询，为 30 秒、三倍失败间隔、两倍扫描间隔中的最大值。
+因此来宾每五秒上报/重试的历史不会在两次请求之间被观察操作清空；观察本身不增加失败轮次。
+过期后新请求重新累计，未使用的过期保护即使尚未扫描也不能阻塞准入；过期不清除 reservation
+或恢复义务。本地 pressure 查询显示各需求的非敏感年龄、额度及失败/critical 轮数。
 宿主 MemAvailable 低于 OperationalMargin 是独立安全输入，不改写 R、不授予操作保留区。
 
 Q 包含已受理的 capture intent、resource-pressure paused 及其 starting 恢复。
@@ -452,6 +456,11 @@ Hook 仍执行，重取 lifecycle lock 后复核完整记录前置条件。窄 d
 Hook 也不能悄悄移除该动作后接管。普通重复 Pause 仍 409，starting 仍冲突。
 后续真实 Wake 按普通恢复规则执行，不增加永久用户暂停锁。接管不是 Release，也不能跳过
 critical 的完整退出条件。
+
+物理释放检查区分旧 VMM 的共享内存占用与 Snapshot 文件缓存。旧进程退出后，磁盘上的
+Snapshot 页面仍可能驻留缓存或处于 dirty 状态，`MemFree` 不保证按旧占用等量增加。
+分别观察旧进程/cgroup 身份、已确认的 reservation 释放、宿主 `MemAvailable` 与存储回写。
+节点不将 Snapshot 文件长度或预测的来宾工作集当作已释放余量。
 
 Sandbox 字段与小型 transition journal 共用现有 SQLite owner，在服务前结合 inventory
 重建。资源热路径不在 State.mu 内 capture、访问文件/网络或 SQLite；admission queue 先于

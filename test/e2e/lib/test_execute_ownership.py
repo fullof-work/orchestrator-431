@@ -210,6 +210,30 @@ class RunnerLifecycleIdentity(unittest.TestCase):
             self.assertEqual(runner_lifecycle.userspace_members(["101", "102", "103", "104"], proc),
                              ["101", "103", "104"])
 
+    def test_namespace_unmapped_zero_is_not_a_local_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            for pid, status in {
+                "101": "Kthread:\t0\n",
+                "102": "Kthread:\t1\n",
+                "103": "Kthread:\t0\n",
+            }.items():
+                (proc / pid).mkdir()
+                (proc / pid / "status").write_text(status)
+            # cgroup.procs uses zero for tasks outside the reader's PID
+            # namespace. No /proc/0 exists; visible extra userspace remains.
+            self.assertEqual(runner_lifecycle.userspace_members(
+                ["0", "101", "0", "102", "103"], proc), ["101", "103"])
+            # Zero alone cannot satisfy snapshot's exactly-one-CH assertion.
+            self.assertEqual(runner_lifecycle.userspace_members(["0", "0"], proc), [])
+
+    def test_zero_does_not_hide_missing_visible_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            with self.assertRaises(FileNotFoundError) as raised:
+                runner_lifecycle.userspace_members(["0", "101"], proc)
+            self.assertEqual(raised.exception.filename, str(proc / "101/status"))
+
     def test_missing_member_identity_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(FileNotFoundError):

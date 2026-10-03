@@ -52,6 +52,11 @@ def userspace_members(members, proc_root=Path("/proc")):
     # of the complete delegated cgroup, including these workers.
     result = []
     for pid in members:
+        # cgroup.procs emits 0 when a task has no PID in the reader's
+        # namespace (for example a host KVM worker). It is not /proc/0.
+        # Visible PIDs still fail closed; assert_dead checks the whole cgroup.
+        if pid == "0":
+            continue
         status = (proc_root / pid / "status").read_text()
         if not any(line.split() == ["Kthread:", "1"] for line in status.splitlines()):
             result.append(pid)

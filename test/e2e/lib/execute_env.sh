@@ -81,8 +81,9 @@ BUILDER_CPU="$(nproc)"
 
 : "${WORK:?WORK must be supplied by the common runner}"
 CASE_OUT="${OUT:-$WORK}"
-WORK="$(mktemp -d /tmp/e-XXXXXX)"
+WORK="$(execute_state_create_work)"
 RUN_KEY="${WORK##*/}"
+EXECUTE_RUN_ROOT="/tmp/$RUN_KEY/run"
 SWITCH="${SWITCH:-x${RUN_KEY#e-}}"
 SW_NETNS="${SW_NETNS:-${RUN_KEY}-sw}"
 PROXY_NETNS="${PROXY_NETNS:-${RUN_KEY}-proxy}"
@@ -108,7 +109,7 @@ execute_state_assert_targets_absent "$BIN" "$SWITCH" "$SW_NETNS" "$PROXY_NETNS" 
 execute_state_assert_units_absent "$RUNNER_PREFIX" "$BUILDER_PREFIX"
 execute_state_reserve "$RUN_KEY" "$WORK" "$SWITCH" "$SW_NETNS" "$PROXY_NETNS" "$PROXY_VETH_HOST" "$PROXY_VETH_NS" -
 EXECUTE_STATE_EXPECTED="$(execute_state_record "$RUN_KEY" "$WORK" "$SWITCH" "$SW_NETNS" "$PROXY_NETNS" "$PROXY_VETH_HOST" "$PROXY_VETH_NS" -)"
-mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
+mkdir -p "$EXECUTE_RUN_ROOT" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
 
 declare -a PIDS=()
 declare -a TAGS=()

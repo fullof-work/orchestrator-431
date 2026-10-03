@@ -58,12 +58,24 @@ def userspace_members(members, proc_root=Path("/proc")):
     return result
 
 
-def snapshot(work, sid, prefix):
+def runtime_root(work, configured=None):
+    root = work / "run" if configured is None else Path(configured)
+    if root == work / "run":
+        return root
+    if (re.fullmatch(r"e-[A-Za-z0-9]{6}", work.name)
+            and root == Path("/tmp") / work.name / "run"
+            and not root.parent.is_symlink()):
+        return root
+    raise ValueError("runtime root is not owned by this execute workspace")
+
+
+def snapshot(work, sid, prefix, run_root=None):
+    run_root = runtime_root(work, run_root)
     state = row(work, sid)
     rid = state["run_id"]
     if state["state"] != "running" or not re.fullmatch(r"sr-[0-9a-fA-F-]{36}", rid):
         raise ValueError("fault injection requires a current running RunID")
-    run_dir, base_dir = work / "run/sandboxes" / sid, work / "lib/sandboxes" / sid
+    run_dir, base_dir = run_root / "sandboxes" / sid, work / "lib/sandboxes" / sid
     if state["run_dir"] != str(run_dir) or state["base_dir"] != str(base_dir):
         raise ValueError("Sandbox directories are not owned by this execute workspace")
     unit = prefix + rid + ".service"
@@ -74,7 +86,7 @@ def snapshot(work, sid, prefix):
     cgroup = props["ControlGroup"]
     if not cgroup.startswith("/") or unit not in cgroup.split("/") or props["ActiveState"] != "active":
         raise ValueError("unit does not own the live test run")
-    parent_pid = int((work / "run/runners" / (rid + ".pid")).read_text())
+    parent_pid = int((run_root / "runners" / (rid + ".pid")).read_text())
     runtime_pid = int((run_dir / (sid + ".pid")).read_text())
     if parent_pid != int(props["MainPID"]) or parent_pid == runtime_pid:
         raise ValueError("resident parent and runtime PID identities are not distinct")
@@ -133,7 +145,8 @@ def verify_lease(work, observed):
         raise ValueError("runtime does not advertise StateSync")
 
 
-def assert_dead(work, observed):
+def assert_dead(work, observed, run_root=None):
+    run_root = runtime_root(work, run_root)
     state = row(work, observed["sid"])
     fields = ("run_id", "run_dir", "base_dir", "vswitch_port", "floatingip", "inner_ip", "port_mac",
               "envd_uds", "ci_uds", "resume_source_kind", "resume_source_ref", "resume_sandbox_ref")
@@ -142,8 +155,8 @@ def assert_dead(work, observed):
     result = json.loads(state["sandbox_result_json"])
     if state["sandbox_result_run_id"] != observed["run_id"] or result["run_id"] != observed["run_id"] or result["sid"] != observed["sid"] or result["stage"] != "run":
         raise ValueError("dead history lost the original execution result identity")
-    for subtree in ("run/sandboxes", "lib/sandboxes"):
-        if (work / subtree / observed["sid"]).exists():
+    for subtree in (run_root / "sandboxes", work / "lib/sandboxes"):
+        if (subtree / observed["sid"]).exists():
             raise ValueError("completed cleanup retained an object directory")
     if (Path("/sys/fs/cgroup") / observed["cgroup"].lstrip("/")).exists():
         raise ValueError("completed cleanup retained the delegated unit subtree")
@@ -184,13 +197,13 @@ def cleanup_diagnostics(work, observed):
     print("runner cleanup diagnostics " + json.dumps(result, sort_keys=True), flush=True)
 
 
-def kill_exact(work, observed, prefix, role):
+def kill_exact(work, observed, prefix, role, run_root=None):
     expected = observed["processes"][role]
     fd = os.pidfd_open(expected["pid"])
     try:
         # Pin the PID first, then revalidate the complete durable/unit/process
         # snapshot. A changed incarnation must never receive the old signal.
-        assert_same_run(observed, snapshot(work, observed["sid"], prefix))
+        assert_same_run(observed, snapshot(work, observed["sid"], prefix, run_root))
         signal.pidfd_send_signal(fd, signal.SIGKILL)
     finally:
         os.close(fd)
@@ -205,19 +218,21 @@ def main():
     parser.add_argument("evidence", type=Path)
     parser.add_argument("--role", choices=("parent", "runtime", "ch"))
     parser.add_argument("--diagnostics", action="store_true")
+    parser.add_argument("--run-root", type=Path)
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,56}", args.sid) or not args.unit_prefix.endswith("@"):
         parser.error("invalid test sandbox or unit prefix")
     work = args.work.resolve()
+    run_root = runtime_root(work, args.run_root)
     if args.operation == "snapshot":
-        args.evidence.write_text(json.dumps(snapshot(work, args.sid, args.unit_prefix), indent=2) + "\n")
+        args.evidence.write_text(json.dumps(snapshot(work, args.sid, args.unit_prefix, run_root), indent=2) + "\n")
         return
     observed = json.loads(args.evidence.read_text())
     if observed["sid"] != args.sid or observed["unit"] != args.unit_prefix + observed["run_id"] + ".service":
         raise ValueError("evidence belongs to another execution")
     if args.operation == "dead":
         try:
-            assert_dead(work, observed)
+            assert_dead(work, observed, run_root)
         except ValueError:
             if args.diagnostics:
                 cleanup_diagnostics(work, observed)
@@ -225,11 +240,11 @@ def main():
     elif args.operation == "lease":
         verify_lease(work, observed)
     elif args.operation == "same-run":
-        assert_same_run(observed, snapshot(work, args.sid, args.unit_prefix))
+        assert_same_run(observed, snapshot(work, args.sid, args.unit_prefix, run_root))
     else:
         if not args.role:
             parser.error("signal requires --role")
-        kill_exact(work, observed, args.unit_prefix, args.role)
+        kill_exact(work, observed, args.unit_prefix, args.role, run_root)
         print("killed exact test-owned", args.role, "for", observed["run_id"])
 
 

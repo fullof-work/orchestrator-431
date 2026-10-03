@@ -88,7 +88,7 @@ want = ("paused", "", "", "", "", "", "", "", "", sys.argv[3])
 raise SystemExit(0 if row == want else 1)
 PY
         then
-            [ ! -e "$WORK/run/sandboxes/$sid" ] && [ -d "$WORK/lib/sandboxes/$sid" ] && return 0
+            [ ! -e "$EXECUTE_RUN_ROOT/sandboxes/$sid" ] && [ -d "$WORK/lib/sandboxes/$sid" ] && return 0
         fi
         sleep 0.1
     done

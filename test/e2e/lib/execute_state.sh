@@ -25,17 +25,69 @@ execute_state_path_absent() {
 
 execute_state_record() { # run-key work switch switch-netns proxy-netns host-veth peer-veth original-forward
     local run_key="$1" work="$2" switch="$3" switch_netns="$4"
-    local proxy_netns="$5" proxy_veth_host="$6" proxy_veth_ns="$7" original_forward="$8"
-    printf 'v1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tsandbox-runner-%s@\tsandbox-builder-%s@\t%s' \
-        "$run_key" "$work" "$switch" "$switch_netns" "$proxy_netns" \
+    local proxy_netns="$5" proxy_veth_host="$6" proxy_veth_ns="$7" original_forward="$8" version="${9:-v2}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tsandbox-runner-%s@\tsandbox-builder-%s@\t%s' \
+        "$version" "$run_key" "$work" "$switch" "$switch_netns" "$proxy_netns" \
         "$proxy_veth_host" "$proxy_veth_ns" "$run_key" "$run_key" "$original_forward"
+}
+
+# The caller supplies TMPDIR (workbench uses disk-backed /build/tmp). Record
+# its physical path so creation and later ownership validation agree. The
+# sentinel preserves trailing newlines until the TSV delimiter check rejects them.
+execute_state_work_root() {
+    local root
+    root="$(CDPATH= cd -P -- "${TMPDIR:-/tmp}" && printf '%s.' "$PWD")" \
+        || { echo "execute temporary root is unavailable" >&2; return 1; }
+    root="${root%.}"
+    case "$root" in
+        *$'\t'*|*$'\n'*) echo "invalid execute temporary root" >&2; return 1 ;;
+    esac
+    printf '%s\n' "$root"
+}
+
+# Allocate the short volatile directory atomically first. Disk-backed work
+# uses the same key, but never lengthens the pathname sockets under /tmp.
+execute_state_create_work() {
+    local root runtime work
+    root="$(execute_state_work_root)" || return 1
+    runtime="$(mktemp -d /tmp/e-XXXXXX)" || return 1
+    work="${root%/}/${runtime##*/}"
+    if [ "$work" != "$runtime" ] && ! mkdir -m 700 -- "$work"; then
+        rmdir -- "$runtime"
+        return 1
+    fi
+    printf '%s\n' "$work"
+}
+
+execute_state_remove_work() { # expected private ownership record
+    execute_state_load || return 1
+    [ "$EXECUTE_STATE_RECORD" = "$1" ] \
+        || { echo "execute recovery state no longer belongs to this run" >&2; return 1; }
+    rm -rf -- "$EXECUTE_STATE_WORK" || return 1
+    if [ "$EXECUTE_STATE_VERSION" = v2 ] && [ "$EXECUTE_STATE_WORK" != "/tmp/$EXECUTE_STATE_RUN_KEY" ]; then
+        rm -rf -- "/tmp/$EXECUTE_STATE_RUN_KEY" || return 1
+    fi
 }
 
 execute_state_validate_fields() {
     [[ "$EXECUTE_STATE_RUN_KEY" =~ ^e-[A-Za-z0-9]{6}$ ]] \
         || { echo "invalid execute recovery run key" >&2; return 1; }
-    [ "$EXECUTE_STATE_WORK" = "/tmp/$EXECUTE_STATE_RUN_KEY" ] \
-        || { echo "invalid execute recovery work directory" >&2; return 1; }
+    # Keep legacy /tmp records recoverable. New locations must be the exact
+    # run directory under the caller's configured root, never an arbitrary path.
+    if [ "$EXECUTE_STATE_WORK" != "/tmp/$EXECUTE_STATE_RUN_KEY" ]; then
+        local root
+        root="$(execute_state_work_root)" || return 1
+        [ "$EXECUTE_STATE_WORK" = "${root%/}/$EXECUTE_STATE_RUN_KEY" ] \
+            || { echo "invalid execute recovery work directory" >&2; return 1; }
+    fi
+    # v1 reserves only WORK. v2 additionally reserves the atomically allocated
+    # /tmp/<run-key> socket directory; never infer ownership for legacy state.
+    if [ "$EXECUTE_STATE_VERSION" = v2 ] && ! execute_state_path_absent "/tmp/$EXECUTE_STATE_RUN_KEY"; then
+        local runtime="/tmp/$EXECUTE_STATE_RUN_KEY"
+        [ ! -L "$runtime" ] && [ -d "$runtime" ] \
+            && [ "$(stat -Lc '%u:%a' "$runtime")" = "$(execute_state_expected_uid):700" ] \
+            || { echo "unsafe execute runtime directory" >&2; return 1; }
+    fi
     local name
     for name in "$EXECUTE_STATE_SWITCH" "$EXECUTE_STATE_SWITCH_NETNS" \
         "$EXECUTE_STATE_PROXY_NETNS" "$EXECUTE_STATE_PROXY_VETH_HOST" \
@@ -70,11 +122,12 @@ execute_state_load() {
     [ "${#lines[@]}" -eq 1 ] \
         || { echo "execute recovery state must contain exactly one line" >&2; return 1; }
     IFS=$'\t' read -r -a fields <<<"${lines[0]}"
-    if [ "${#fields[@]}" -ne 11 ] || [ "${fields[0]}" != v1 ]; then
+    if [ "${#fields[@]}" -ne 11 ] || { [ "${fields[0]}" != v1 ] && [ "${fields[0]}" != v2 ]; }; then
         echo "invalid execute recovery state schema" >&2
         return 1
     fi
 
+    EXECUTE_STATE_VERSION="${fields[0]}"
     EXECUTE_STATE_RUN_KEY="${fields[1]}"
     EXECUTE_STATE_WORK="${fields[2]}"
     EXECUTE_STATE_SWITCH="${fields[3]}"
@@ -124,11 +177,11 @@ execute_state_remember_forwarding() { # original-forward
         || { echo "execute recovery forwarding state was already recorded" >&2; return 1; }
     expected="$(execute_state_record "$EXECUTE_STATE_RUN_KEY" "$EXECUTE_STATE_WORK" \
         "$EXECUTE_STATE_SWITCH" "$EXECUTE_STATE_SWITCH_NETNS" "$EXECUTE_STATE_PROXY_NETNS" \
-        "$EXECUTE_STATE_PROXY_VETH_HOST" "$EXECUTE_STATE_PROXY_VETH_NS" -)"
+        "$EXECUTE_STATE_PROXY_VETH_HOST" "$EXECUTE_STATE_PROXY_VETH_NS" - "$EXECUTE_STATE_VERSION")"
     [ "$EXECUTE_STATE_RECORD" = "$expected" ] || return 1
     record="$(execute_state_record "$EXECUTE_STATE_RUN_KEY" "$EXECUTE_STATE_WORK" \
         "$EXECUTE_STATE_SWITCH" "$EXECUTE_STATE_SWITCH_NETNS" "$EXECUTE_STATE_PROXY_NETNS" \
-        "$EXECUTE_STATE_PROXY_VETH_HOST" "$EXECUTE_STATE_PROXY_VETH_NS" "$original_forward")"
+        "$EXECUTE_STATE_PROXY_VETH_HOST" "$EXECUTE_STATE_PROXY_VETH_NS" "$original_forward" "$EXECUTE_STATE_VERSION")"
     execute_state_write_record "$record" 1
 }
 
@@ -415,7 +468,7 @@ execute_state_recover() { # bin
     execute_state_restore_forwarding "$EXECUTE_STATE_ORIGINAL_FORWARD" || return 1
     execute_state_resources_absent "$bin" \
         || { echo "interrupted execute resources remain; preserving recovery state" >&2; return 1; }
-    rm -rf -- "$EXECUTE_STATE_WORK" || return 1
+    execute_state_remove_work "$EXECUTE_STATE_RECORD" || return 1
     rm -f -- "$(execute_state_path)" || return 1
 }
 

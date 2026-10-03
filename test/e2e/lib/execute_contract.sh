@@ -48,7 +48,11 @@ cleanup() {
         mkdir -p "$CASE_OUT/runtime"
         cp "$WORK"/*.log "$WORK"/*.out "$WORK"/*.journal "$CASE_OUT/runtime/" 2>/dev/null || true
     fi
-    [ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"
+    if [ -n "${E2E_KEEP:-}" ]; then
+        echo "kept work dir: $WORK"
+    elif [ -n "${EXECUTE_STATE_EXPECTED:-}" ]; then
+        execute_state_remove_work "$EXECUTE_STATE_EXPECTED" || return 1
+    fi
     if [ -n "${EXECUTE_STATE_EXPECTED:-}" ] && [ "$forwarding_clean" = 1 ]; then
         execute_state_finish "$BIN" "$EXECUTE_STATE_EXPECTED" || true
     fi

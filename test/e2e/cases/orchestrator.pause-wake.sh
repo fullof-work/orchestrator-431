@@ -22,7 +22,7 @@ wait_sandbox_state "$SID" running 1200 || fail "sandbox did not reach running"
 MARK="STATE_$RANDOM"
 . "$SCRIPT_DIR/guest_service.sh"
 start_freeze_service
-"$BIN/sandbox-ctl" exec --path-id "$SID" --run-root "$WORK/run/sandboxes" -- /bin/sh -ceu '
+"$BIN/sandbox-ctl" exec --path-id "$SID" --run-root "$EXECUTE_RUN_ROOT/sandboxes" -- /bin/sh -ceu '
 pid=$1
 global=/proc/1/root/sys/fs/cgroup
 real=$global/app
@@ -126,7 +126,7 @@ assert_native_usage "$SID" paused
 # this host wall-clock interval.
 sleep 3
 assert_snapshot_argv "$UNSET_CALL" \
-    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$EXECUTE_RUN_ROOT/sandboxes" \
     || fail "all-unset local Pause did not pass the configured mode"
 B_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
 [ -f "$B_LOCAL" ] || fail "local Pause did not create $B_LOCAL"
@@ -172,7 +172,7 @@ echo "==> PASS: all-unset B restored envd-managed PID $FREEZE_PID + listener; fr
 code=$(req DELETE "/sandboxes/$SID" "$AK")
 [ "$code" = 204 ] || fail "delete=$code"
 wait_sandbox_state "$SID" missing 120 || fail "delete finalizer retained row"
-[ ! -e "$WORK/run/sandboxes/$SID" ] && [ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "delete retained owned directories"
+[ ! -e "$EXECUTE_RUN_ROOT/sandboxes/$SID" ] && [ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "delete retained owned directories"
 [ -f "$WORK/lib/node-ctl.db" ] && [ -S "$WORK/node-ctl.socket" ] || fail "finalizer removed node files"
 # Restart the conductor against the same store with explicit node defaults.
 # Local mode must remain warning-free; these values are inherited only when a
@@ -219,7 +219,7 @@ if got != want:
 PY
 echo "==> PASS: Create checkpoint header overlaid body per field and persisted canonical metadata"
 
-ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
+ENVD_SOCK="$EXECUTE_RUN_ROOT/sandboxes/$SID/envd.sock"
 EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue policy sandbox exec capability"
 POLICY_START_MARK="POLICY_CREATE_ACTIVATION_$RANDOM"
 exec_through_connect "$SID" "$EXEC_TOKEN" "$POLICY_START_MARK"
@@ -238,7 +238,7 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" \
 unset REQ_CHECKPOINT_HEADER
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; sed 's/^/  orch| /' "$WORK/orch-node-policy.log"; fail "policy pause=$code (want 204)"; }
 assert_snapshot_argv "$POLICY_CALL" \
-    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$EXECUTE_RUN_ROOT/sandboxes" \
     --merge-ref=false --drop-caches=false \
     || fail "Pause body/header policy did not reach sandbox-ctl exactly"
 W_POLICY="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
@@ -333,7 +333,7 @@ E_LOCAL_EXPORT_CALL=$(export_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "local Sandbox E pause=$code (want 204)"; }
 assert_export_argv "$E_LOCAL_EXPORT_CALL" \
-    export --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    export --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$EXECUTE_RUN_ROOT/sandboxes" \
     || fail "Pause(memory=false) did not execute sandbox-ctl export in local mode"
 E_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.sandbox"
 [ -e "$E_LOCAL" ] || fail "Pause(memory=false) did not create $E_LOCAL"
@@ -407,7 +407,7 @@ done
 [ -n "$AUTO_PAUSED" ] || { sed 's/^/  orch| /' "$WORK/orch-node-policy.log"; fail "reaper did not auto-pause policy sandbox (last state=$state)"; }
 wait_paused_cleanup "$SID" || fail "auto-paused runtime ownership did not durably clear"
 assert_snapshot_argv "$AUTO_CALL" \
-    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$EXECUTE_RUN_ROOT/sandboxes" \
     --merge-ref=false --drop-caches=false \
     || fail "auto-pause did not resolve metadata > node fieldwise"
 [ -f "$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot" ] || fail "auto-pause did not create local W"
@@ -431,7 +431,7 @@ code=$(req POST /sandboxes "$AK" "$AUTO_E_BODY")
 [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "autoPauseMemory=false create=$code"; }
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
-ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
+ENVD_SOCK="$EXECUTE_RUN_ROOT/sandboxes/$SID/envd.sock"
 EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "autoPauseMemory=false exec capability"
 exec_through_connect "$SID" "$EXEC_TOKEN" "AUTO_E_START_$RANDOM"
 wait_sandbox_state "$SID" running 1200 || fail "autoPauseMemory=false sandbox did not reach running"
@@ -441,7 +441,7 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "autoPauseMemory=false explicit Pause({})=$code"; }
 wait_paused_cleanup "$SID" || fail "explicit paused runtime ownership did not durably clear"
 assert_snapshot_argv "$AUTO_E_EXPLICIT_S_CALL" \
-    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$EXECUTE_RUN_ROOT/sandboxes" \
     --merge-ref=true --drop-caches=false \
     || fail "explicit Pause({}) inherited AutoPauseMemory=false instead of capturing Snapshot S"
 python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY' \
@@ -472,7 +472,7 @@ done
 [ -n "$AUTO_E_PAUSED" ] || fail "autoPauseMemory=false TTL did not pause"
 wait_paused_cleanup "$SID" || fail "TTL paused runtime ownership did not durably clear"
 assert_export_argv "$AUTO_E_TTL_CALL" \
-    export --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    export --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$EXECUTE_RUN_ROOT/sandboxes" \
     || fail "autoPauseMemory=false TTL did not capture Sandbox E"
 python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY' \
     || fail "autoPauseMemory=false TTL durable source is incorrect"

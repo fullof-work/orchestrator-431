@@ -52,7 +52,7 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" \
     '{"memory":true,"checkpoint_merge_ref":false,"checkpoint_drop_caches":false}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "portable W pause=$code (want 204)"; }
 assert_snapshot_argv "$PORTABLE_W_CALL" \
-    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$EXECUTE_RUN_ROOT/sandboxes" \
     --merge-ref=false --drop-caches=false \
     || fail "portable W Pause policy did not reach sandbox-ctl exactly"
 W_PORTABLE_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
@@ -196,7 +196,7 @@ grep -q "$PERSIST" "$WORK/portable-read.out" || { sed 's/^/  guest| /' "$WORK/po
 # The working-set memory intentionally retained guest cache, so evict it before
 # reading the W-only file. This makes the assertion prove the retained local
 # checkpoint's disk artifact, independently of the restored memory self/lower chain.
-"$BIN/sandbox-ctl" exec --path-id "$SID" --run-root "$WORK/run/sandboxes" -- /bin/sh -c \
+"$BIN/sandbox-ctl" exec --path-id "$SID" --run-root "$EXECUTE_RUN_ROOT/sandboxes" -- /bin/sh -c \
     'sync && echo 3 > /proc/sys/vm/drop_caches && cat /home/user/working-set-disk.txt' \
     >"$WORK/portable-disk-read.out" 2>&1 || true
 grep -q "$W_DISK_PERSIST" "$WORK/portable-disk-read.out" \
@@ -224,7 +224,7 @@ echo "==> PASS: keep-source W resumed envd-managed PID/listener from its retaine
 
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill first sandbox before KMT import=$code (want 204)"
 wait_sandbox_state "$SID" missing 120 || fail "Sandbox delete finalizer retained durable row"
-[ ! -e "$WORK/run/sandboxes/$SID" ] || fail "Sandbox delete retained RunDir"
+[ ! -e "$EXECUTE_RUN_ROOT/sandboxes/$SID" ] || fail "Sandbox delete retained RunDir"
 [ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "Sandbox delete retained BaseDir"
 [ ! -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "Sandbox delete retained the keep-source checkpoint"
 [ -f "$WORK/lib/node-ctl.db" ] || fail "Sandbox cleanup removed node-level database"
@@ -282,7 +282,7 @@ code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}
 [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "bundle create=$code"; }
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
-ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
+ENVD_SOCK="$EXECUTE_RUN_ROOT/sandboxes/$SID/envd.sock"
 EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue bundle sandbox exec capability"
 exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_START_$RANDOM"
 wait_sandbox_state "$SID" running 20 || fail "bundle sandbox did not reach running"
@@ -296,7 +296,7 @@ BUNDLE_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle pause=$code"; }
 assert_snapshot_argv "$BUNDLE_CALL" \
-    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$EXECUTE_RUN_ROOT/sandboxes" \
     --merge-ref=false \
     || fail "bundle Pause did not pass --mode bundle exactly"
 BUNDLE_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
@@ -319,7 +319,7 @@ BUNDLE_B_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle B pause=$code"; }
 assert_snapshot_argv "$BUNDLE_B_CALL" \
-    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$EXECUTE_RUN_ROOT/sandboxes" \
     --merge-ref=false \
     || fail "bundle B Pause did not pass --mode bundle exactly"
 BUNDLE_B_TARGET=$(readlink -f "$BUNDLE_LOCAL")
@@ -372,7 +372,7 @@ BUNDLE_PROMOTE_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle C promote pause=$code"; }
 assert_snapshot_argv "$BUNDLE_PROMOTE_CALL" \
-    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$EXECUTE_RUN_ROOT/sandboxes" \
     --merge-ref=false \
     || fail "bundle C Pause did not pass --mode bundle exactly"
 BUNDLE_PROMOTE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
@@ -428,7 +428,7 @@ E_BUNDLE_EXPORT_CALL=$(export_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "Bundle Sandbox E pause=$code"; }
 assert_export_argv "$E_BUNDLE_EXPORT_CALL" \
-    export --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
+    export --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$EXECUTE_RUN_ROOT/sandboxes" \
     || fail "Pause(memory=false) did not execute Bundle export"
 E_BUNDLE_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.sandbox"
 [ -L "$E_BUNDLE_LOCAL" ] || fail "Bundle Sandbox E did not retain $E_BUNDLE_LOCAL symlink"
@@ -474,7 +474,7 @@ E_BUNDLE_TOKEN=$(json_field "$WORK/bundle-e-move.json" result)
 E_BUNDLE_REMOTE_REF=$(json_field "$WORK/bundle-e-move.json" sandboxRef)
 case "$E_BUNDLE_TOKEN" in kmt1.*) ;; *) fail "Bundle E move returned a non-KMT result" ;; esac
 wait_sandbox_state "$SID" missing 120 || fail "Bundle E move finalizer retained durable row"
-[ ! -e "$WORK/run/sandboxes/$SID" ] || fail "Bundle E move retained RunDir"
+[ ! -e "$EXECUTE_RUN_ROOT/sandboxes/$SID" ] || fail "Bundle E move retained RunDir"
 [ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "Bundle E move retained BaseDir/checkpoint"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$E_BUNDLE_REMOTE_REF" >"$WORK/bundle-e-moved-remote.json" \
@@ -518,7 +518,7 @@ E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" --to-template -
 [ "$(json_field "$WORK/portable-e-move.json" sandboxRef)" = "$E_BUNDLE_REMOTE_REF" ] \
     || fail "portable E move changed the published root"
 wait_sandbox_state "$SID" missing 120 || fail "portable E move finalizer retained durable row"
-[ ! -e "$WORK/run/sandboxes/$SID" ] || fail "portable E move retained RunDir"
+[ ! -e "$EXECUTE_RUN_ROOT/sandboxes/$SID" ] || fail "portable E move retained RunDir"
 [ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "portable E move retained stale BaseDir/checkpoint"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$E_BUNDLE_REMOTE_REF" >"$WORK/portable-e-moved-remote.json" \

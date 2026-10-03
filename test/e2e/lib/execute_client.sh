@@ -211,5 +211,5 @@ create_guest() {
     ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
     FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
     assert_no_default_exec_token "$WORK/resp.body" || fail "default exec token"
-    ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
+    ENVD_SOCK="$EXECUTE_RUN_ROOT/sandboxes/$SID/envd.sock"
 }

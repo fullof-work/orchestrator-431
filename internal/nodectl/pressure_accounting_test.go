@@ -148,7 +148,7 @@ func TestPartialUnexecutableGrantDoesNotMaskPressure(t *testing.T) {
 	}
 }
 
-func TestTokenOnlyGrowAndHostSafetyHaveSeparateSignals(t *testing.T) {
+func TestTokenOnlyGrowDoesNotCreateMemoryPressure(t *testing.T) {
 	s, now := pressureTestState(t)
 	installReservationForTest(t, s, Reservation{SandboxID: "grow", Token: "t", Capacity: Resources{MemoryBytes: 1000}, ReservationMemory: 100, Stage: StageSettled})
 	a := NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: 1, MinGrantStep: 1, MaxGrantStep: 500})
@@ -161,18 +161,6 @@ func TestTokenOnlyGrowAndHostSafetyHaveSeparateSignals(t *testing.T) {
 	}
 	if p := s.PressureSnapshot(); p.Zone != ZoneGreen || p.PauseEligible {
 		t.Fatalf("rate limit counted as memory shortage: %+v", p)
-	}
-	s.OperationalMargin.MemoryBytes = 100
-	for i := 0; i < 6; i++ {
-		s.ObserveHostAvailable(50)
-		*now = now.Add(time.Second)
-	}
-	if p := s.PressureSnapshot(); p.Zone != ZoneCritical || !p.PauseEligible || !p.HostSafety || p.RawZone != ZoneGreen || p.ReservedMemory != 100 {
-		t.Fatalf("host safety changed reservation or failed to escalate: %+v", p)
-	}
-	s.ObserveHostAvailable(100)
-	if s.PressureSnapshot().HostSafety {
-		t.Fatal("host safety did not clear on observed relief")
 	}
 }
 

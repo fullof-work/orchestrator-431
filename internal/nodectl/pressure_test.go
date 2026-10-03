@@ -1,6 +1,7 @@
 package nodectl
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -245,5 +246,134 @@ func TestPressureRestartAndImpossibleDemand(t *testing.T) {
 	*now = now.Add(5 * time.Second)
 	if p := s.PressureSnapshot(); p.Zone != ZoneRed {
 		t.Fatalf("restart exit did not pass red: %+v", p)
+	}
+}
+
+// Observation advances time and expiry, never a failed resource transaction.
+// A full pool alone is not authority to interrupt an otherwise running VM.
+func TestPressureScansWithoutDemandDoNotPause(t *testing.T) {
+	for _, reserved := range []uint64{100, 950} {
+		s, now := pressureTestState(t)
+		installReservationForTest(t, s, Reservation{SandboxID: "running", Token: "running", Capacity: Resources{MemoryBytes: 1000}, ReservationMemory: reserved, Stage: StageSettled})
+		wantZone := ZoneGreen
+		if reserved == 950 {
+			wantZone = ZoneCritical
+		}
+		for scan := 0; scan < 20; scan++ {
+			*now = now.Add(s.pressure.policy.FailureInterval)
+			if p := s.PressureSnapshot(); p.Zone != wantZone || p.RawZone != wantZone || p.PauseEligible || len(p.Demands) != 0 || p.ReservedMemory != reserved {
+				t.Fatalf("R=%d scan=%d fabricated pressure or changed accounting: %+v", reserved, scan, p)
+			}
+			if s.BeginPressurePause("running", 1) {
+				t.Fatalf("R=%d: a scan authorized Pause without a demand", reserved)
+			}
+		}
+	}
+}
+
+func TestPressureSnapshotDoesNotClaimWholeHostSafety(t *testing.T) {
+	s, _ := pressureTestState(t)
+	body, err := json.Marshal(s.PressureSnapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := fields["host_safety_blocked"]; present {
+		t.Fatal("pool diagnostics still claim to report whole-host memory safety")
+	}
+}
+
+func TestHistoricalHostPressureReasonUsesNormalRelief(t *testing.T) {
+	for _, barrier := range []string{"none", "obligation", "cleanup"} {
+		t.Run(barrier, func(t *testing.T) {
+			s, now := pressureTestState(t)
+			installReservationForTest(t, s, Reservation{SandboxID: "running", Token: "running", Capacity: Resources{MemoryBytes: 1000}, ReservationMemory: 100, Stage: StageSettled})
+			policy := DefaultPressurePolicy()
+			if err := s.ConfigurePressure(policy, PressureRecord{Zone: ZoneCritical, Version: 12, Reason: "host_operational_margin", SinceUnix: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if p := s.PressureSnapshot(); p.Zone != ZoneCritical || p.Reason != "host_operational_margin" || p.PauseEligible || len(p.Demands) != 0 || p.ReservedMemory != 100 {
+				t.Fatalf("historical reason became a demand or bypassed restart hold: %+v", p)
+			}
+			if barrier != "none" {
+				phase, cleanup := "paused", false
+				if barrier == "cleanup" {
+					phase, cleanup = "", true
+				}
+				s.ObserveObligation("old-run", 1, phase, cleanup)
+				*now = now.Add(time.Hour)
+				p := s.PressureSnapshot()
+				if p.Zone != ZoneCritical || p.PauseEligible || len(p.Demands) != 0 || p.ReservedMemory != 100 || (barrier == "obligation" && p.Pending != 1) || (barrier == "cleanup" && p.Cleanup != 1) {
+					t.Fatalf("policy change discharged durable recovery/cleanup state: %+v", p)
+				}
+				s.ObserveObligation("old-run", 2, "", false)
+			}
+			*now = now.Add(policy.CriticalExitHold - time.Nanosecond)
+			if p := s.PressureSnapshot(); p.Zone != ZoneCritical {
+				t.Fatalf("critical exit hold was shortened: %+v", p)
+			}
+			*now = now.Add(time.Nanosecond)
+			if p := s.PressureSnapshot(); p.Zone != ZoneRed || p.Reason != "stable_relief" || p.Pending != 0 || p.Cleanup != 0 || p.ReservedMemory != 100 {
+				t.Fatalf("historical critical did not exit normally through red: %+v", p)
+			}
+			_ = s.PressureSnapshot() // Start the independent red hold.
+			*now = now.Add(policy.RedToYellowHold)
+			if p := s.PressureSnapshot(); p.Zone != ZoneYellow {
+				t.Fatalf("red hold did not converge: %+v", p)
+			}
+			_ = s.PressureSnapshot() // Start the independent yellow hold.
+			*now = now.Add(policy.YellowToGreenHold)
+			if p := s.PressureSnapshot(); p.Zone != ZoneGreen || p.ReservedMemory != 100 || len(p.Demands) != 0 {
+				t.Fatalf("historical episode failed to converge without changing charge: %+v", p)
+			}
+		})
+	}
+}
+
+func TestPressureGrowWaitsForReleaseNotZoneRelief(t *testing.T) {
+	const mib = uint64(1 << 20)
+	s := NewState(1024*mib, 1000, 0, 0, Watermarks{LowFactor: .7, HighFactor: .85, EmergencyFactor: .05, StartupFactor: .5})
+	now := time.Now()
+	s.initPressureLocked()
+	s.pressure.clock = func() time.Time { return now }
+	pool := s.AllocatablePool.MemoryBytes
+	emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
+	initial := uint64(128 * mib)
+	victim := pool - emergency - initial
+	installReservationForTest(t, s, Reservation{SandboxID: "grow", Token: "grow", Capacity: Resources{MemoryBytes: pool}, ReservationMemory: initial, Stage: StageSettled})
+	installReservationForTest(t, s, Reservation{SandboxID: "victim", Token: "victim", Capacity: Resources{MemoryBytes: pool}, ReservationMemory: victim, Stage: StageSettled})
+	allocator := NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: pool, MinGrantStep: 64 * mib, MaxGrantStep: 64 * mib})
+	for attempt := 0; attempt < s.pressure.policy.CriticalAfterRounds+s.pressure.policy.PauseAfterRounds; attempt++ {
+		got, found, err := s.ReconcileAndGrant("grow", initial, 64*mib, UrgencyNormal, allocator)
+		if err != nil || !found || got.Decision.GrantedDelta != 0 {
+			t.Fatalf("attempt %d consumed unavailable pool memory: %+v %v", attempt, got, err)
+		}
+		now = now.Add(s.pressure.policy.FailureInterval)
+	}
+	if !s.BeginPressurePause("victim", 1) {
+		t.Fatal("valid sustained grow demand did not authorize Pause")
+	}
+	for _, phase := range []string{"capturing", "paused"} {
+		s.ObserveResourceObligation("victim", 1, phase, false, true)
+		got, found, err := s.ReconcileAndGrant("grow", initial, 64*mib, UrgencyNormal, allocator)
+		if err != nil || !found || got.Decision.GrantedDelta != 0 {
+			t.Fatalf("%s was mistaken for released funds: %+v %v", phase, got, err)
+		}
+		if p := s.PressureSnapshot(); p.ReservedMemory != initial+victim || p.Pending != 1 {
+			t.Fatalf("%s changed charge or discharged Q: %+v", phase, p)
+		}
+	}
+	if _, found, err := s.Release("victim"); err != nil || !found {
+		t.Fatalf("confirmed victim Release failed: found=%v err=%v", found, err)
+	}
+	got, found, err := s.ReconcileAndGrant("grow", initial, 64*mib, UrgencyNormal, allocator)
+	if err != nil || !found || got.Decision.GrantedDelta != 64*mib {
+		t.Fatalf("released budget remained blocked by sticky critical: %+v %v", got, err)
+	}
+	if p := s.PressureSnapshot(); p.Zone != ZoneCritical || p.RawZone != ZoneGreen || p.Pending != 1 || p.ReservedMemory != initial+64*mib || len(p.Demands) != 0 {
+		t.Fatalf("grant changed the recovery obligation or failed to consume actual headroom: %+v", p)
 	}
 }

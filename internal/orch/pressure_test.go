@@ -273,9 +273,14 @@ func TestPressureSelectionUsesContinuousAgeAndSoftProtection(t *testing.T) {
 	if got := pressurePauseCandidate(rows, p, now, nil, 30*time.Second, eligible); got != nil {
 		t.Fatal("ignored beneficiary or soft run window")
 	}
-	p.HostSafety = true
+	p.Zone = nodectl.ZoneCritical
+	p.PauseEligible = true
+	if got := pressurePauseCandidate(rows, p, now, nil, 30*time.Second, eligible); got != nil {
+		t.Fatal("critical pressure bypassed the minimum run window")
+	}
+	now = now.Add(30 * time.Second)
 	if got := pressurePauseCandidate(rows, p, now, nil, 30*time.Second, eligible); got == nil || got.ID != "old-created-new-run" {
-		t.Fatal("host safety could not break soft run protection")
+		t.Fatal("eligible candidate remained protected after its run window")
 	}
 	if got := pressurePauseCandidate(rows, p, now, map[string]time.Time{"old-created-new-run": now.Add(time.Second)}, 0, eligible); got != nil {
 		t.Fatal("failed candidate ignored backoff")
@@ -294,7 +299,6 @@ func pressureCaptureFixture(t *testing.T) (*Orchestrator, *types.Sandbox, *nodec
 	if err := s.ConfigurePressure(p, nodectl.PressureRecord{Zone: nodectl.ZoneCritical, Version: 1}); err != nil {
 		t.Fatal(err)
 	}
-	s.OperationalMargin.MemoryBytes = 64 << 20
 	_, _, err := s.Admit(nodectl.AdmitSpec{SandboxID: sb.ID, Token: "live", Capacity: nodectl.Resources{MemoryBytes: 1 << 30}, InitialBudget: 512 << 20})
 	if err != nil {
 		t.Fatal(err)
@@ -302,7 +306,13 @@ func pressureCaptureFixture(t *testing.T) (*Orchestrator, *types.Sandbox, *nodec
 	if _, _, err = s.SetSettled("live", 0, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	s.ObserveHostAvailable(0)
+	// A complete saved-source budget can fit this pool only after the live
+	// charge is released. Model its authoritative, eligible admission wait,
+	// rather than injecting whole-host availability into the node controller.
+	s.RecordAdmissionWait("saved-waiter", nodectl.LaunchAdmission{Operation: nodectl.OperationRecovery, SavedSource: true, Identity: "saved-waiter:1"}, s.AllocatablePool.MemoryBytes)
+	if p := s.PressureSnapshot(); !p.PauseEligible || p.Beneficiary != "saved-waiter" || p.ReservedMemory != 512<<20 {
+		t.Fatalf("fixture did not establish a real pool-budget wait: %+v", p)
+	}
 	return o, sb, s, lc, vs, args
 }
 

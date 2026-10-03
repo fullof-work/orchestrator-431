@@ -157,7 +157,7 @@ node-ctl resource pressure [--socket CONTROL_SOCKET]
 reserved memory、startup in-flight、zone 和 recovery 数量。`list` 输出逐 sandbox
 reservation。`drain` 只禁止新 admission,不改变任何 live reservation。
 
-`pressure` 通过 conductor control socket（或 NODE_CTL_SOCKET）的 `GET /internal/admin/resource-pressure` 查询，沿用本地 admin 认证。返回有效/原始水位、进入原因/版本/时间、R/P/E、剩余 hold、保护额度、按阶段统计的 Q、清理屏障、最老等待、宿主安全压力、逐沙箱暂停原因/运行起点和有界最近操作结果。现役 resource reservation 协议不变。
+`pressure` 通过 conductor control socket（或 NODE_CTL_SOCKET）的 `GET /internal/admin/resource-pressure` 查询，沿用本地 admin 认证。返回有效/原始水位、进入原因/版本/时间、R/P/E、剩余 hold、保护额度、按阶段统计的 Q、清理屏障、最老等待、逐沙箱暂停原因/运行起点和有界最近操作结果。现役 resource reservation 协议不变。不再输出原 `host_safety_blocked` 诊断字段；该查询不测量整机内存安全状态。
 
 不存在 `resource grant` 或 `resource reclaim`。Headroom 属于 sandbox policy,应通过受支持的 sandbox 配置/生命周期输入选择,
 再由 sandbox 既有闭环根据 observation 收敛。这不引入 node 侧 live policy reload
@@ -280,6 +280,13 @@ StartupPool         = AllocatablePool * startup_factor
 `NodeBudget` 是现役 status/wire 名称,其值为配置或探测到的物理资源总量;不能在公式
 中再次把它当作已经扣除 `HostReserved` 的结果。
 
+共享宿主上应通过 `resources.physical_memory` 和 `host_reserved` 明确本控制器获分配的
+预算，并为其他服务留出资源。`physical_memory: auto` 仅在配置解析时读取宿主 `MemTotal`；
+探测到整机容量不代表控制器独占整机。OperationalMargin 仍作为静态操作余量从 P 中扣除，
+既不授予沙箱，也不作为整机可用内存的阈值。运行期节点闭环不采样宿主 `MemAvailable`，
+不根据其他服务暂时闲置的内存推导自身资源池。Guest 观测及 sandbox-local Budget 闭环
+保持独立，不作修改。
+
 减法使用不下溢的资源运算。所有 reservation 更新与 aggregate 更新位于同一 State
 临界区。插入或 recovery replacement 在修改索引前验证 aggregate 加法不会溢出。
 
@@ -312,7 +319,8 @@ yellow 不是节点拒绝 cluster-create 的模式。NodeList 不新增动态水
 因此来宾每五秒上报/重试的历史不会在两次请求之间被观察操作清空；观察本身不增加失败轮次。
 过期后新请求重新累计，未使用的过期保护即使尚未扫描也不能阻塞准入；过期不清除 reservation
 或恢复义务。本地 pressure 查询显示各需求的非敏感年龄、额度及失败/critical 轮数。
-宿主 MemAvailable 低于 OperationalMargin 是独立安全输入，不改写 R、不授予操作保留区。
+只有受控资源池内因内存不足而阻塞的有效需求才推进压力轮次。整机可用内存不产生
+demand，也不授权资源 Pause；仅有 critical 水位、没有合格需求时不会自动 Pause。
 
 Q 包含已受理的 capture intent、resource-pressure paused 及其 starting 恢复。
 即使 RawZone green，只要 Q>0 仍保持 critical。退出同时要求 Q=0、相关未核实清理结束、
@@ -320,6 +328,8 @@ RawZone 低于 critical、无活跃合格内存阻塞，并连续满足 exit hol
 red 要求 RawZone 连续低于 red 达到自身 hold 后到 yellow；yellow 要求 RawZone 连续
  green 达到自身 hold 后到 green。反弹重置计时，一次评估至多下降一级。
 重启在准入前装载 journal/义务，单调 hold 时钟重新开始。
+`host_operational_margin` 等历史转换原因仅保留为标签，不据此重建需求。策略变更不清空
+既有 Q、清理屏障或 reservation；它们继续按原有恢复和逐级退出规则收敛。
 
 ### 4.3 runtime grant
 
@@ -334,6 +344,9 @@ NewReservation = CurrentReservation + GrantedDelta
 ```
 
 普通新增 grow 按实际 P-R-E 再扣除其他受益者未兑现保护；high 可用 E，但总量不超过 P。有效 red/critical 本身不禁止 runtime grow。已占账 replay 不重复计费或扣 token。选中的一个 resume/grow 需求保护释放空间，直到 Admit、可执行进展、取消或未兑现 hold 到期；resume 优先于 grow。取消保护不释放 live reservation。
+
+开始 capture 或提交 paused 行不代表已有可授予额度。只有安全 shrink 或确认 Release
+才减少 R；释放出的额度可供合格 grow 使用，即使 Q 或 exit hold 仍让有效水位保持 critical。
 
 sandbox 可收到 partial grant。sandboxer 会先累积 reservation，只有当额度足以表示一个
 balloon target 按 64 MiB 对齐的更大 Budget 时才执行 balloon deflate，因此取整不会制造未保留内存。
@@ -449,8 +462,9 @@ snapshot 格式。Checkpoint 必须落到磁盘，拒绝 tmpfs/ramfs；只有实
 变化不重置该间隔；繁忙节点不能要求全节点停止分配，才恢复无人访问的资源暂停沙箱。
 `headroom_stable` 仅用于诊断，不是恢复准入前提。随后 sandboxer 给出精确 I，最终资源准入
 仍等待完整预算才启动 VM；节奏计时不授予内存。
-Starting 在实际 running 提交前仍属于 Q。最短运行窗口抑制刚恢复就换出，真实宿主安全
-压力可打破该软保护。有效需求可在 critical 中协调进一步 Pause，不等待被 Q 自身阻挡的
+Starting 在实际 running 提交前仍属于 Q。最短运行窗口抑制刚恢复就换出；如果所有
+其他条件合格的对象仍在窗口内，选择过程等待窗口到期，不根据整机可用内存绕过配置的
+保护。有效需求可在 critical 中协调进一步 Pause，不等待被 Q 自身阻挡的
 降级。制品缺失/损坏、磁盘满/慢和容量失败保留源与义务并进入操作诊断。既有 Deadline
 终结、显式 Delete 通过同一生命周期所有者解除意图。
 
@@ -465,8 +479,9 @@ critical 的完整退出条件。
 
 物理释放检查区分旧 VMM 的共享内存占用与 Snapshot 文件缓存。旧进程退出后，磁盘上的
 Snapshot 页面仍可能驻留缓存或处于 dirty 状态，`MemFree` 不保证按旧占用等量增加。
-分别观察旧进程/cgroup 身份、已确认的 reservation 释放、宿主 `MemAvailable` 与存储回写。
-节点不将 Snapshot 文件长度或预测的来宾工作集当作已释放余量。
+隔离验证时分别观察旧进程/cgroup 身份、已确认的 reservation 释放、宿主 `MemAvailable`
+与存储回写。这些整机测量仅用于测试诊断，不是节点控制输入。节点不将 Snapshot 文件
+长度或预测的来宾工作集当作已释放余量。
 
 Sandbox 字段与小型 transition journal 共用现有 SQLite owner，在服务前结合 inventory
 重建。资源热路径不在 State.mu 内 capture、访问文件/网络或 SQLite；admission queue 先于

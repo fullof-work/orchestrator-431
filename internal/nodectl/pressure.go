@@ -81,7 +81,6 @@ type PressureRecord struct {
 }
 
 type PressureSnapshot struct {
-	HostSafety      bool   `json:"host_safety_blocked"`
 	HeadroomStable  bool   `json:"headroom_stable"`
 	PoolMemory      uint64 `json:"pool_memory"`
 	ReservedMemory  uint64 `json:"reserved_memory"`
@@ -395,11 +394,7 @@ func (s *State) failDemandLocked(key, sid, identity string, amount, baseline uin
 	if p.record.Zone == ZoneCritical {
 		d.critical++
 	} else if d.rounds >= p.policy.CriticalAfterRounds {
-		reason := "sustained_memory_demand"
-		if key == "host-safety" {
-			reason = "host_operational_margin"
-		}
-		s.transitionPressureLocked(ZoneCritical, reason, now)
+		s.transitionPressureLocked(ZoneCritical, "sustained_memory_demand", now)
 		d.critical = 0
 	}
 	// Select one beneficiary. Recovery outranks grow; within a class the first
@@ -485,8 +480,7 @@ func (s *State) PressureSnapshot() PressureSnapshot {
 	}
 	s.advancePressureLocked(now)
 	p := &s.pressure
-	_, hostSafety := p.demands["host-safety"]
-	out := PressureSnapshot{HostSafety: hostSafety, HeadroomStable: now.Sub(p.lastReservationChange) >= p.policy.Interval, PressureRecord: p.record, RawZone: s.memoryZoneForReservedLocked(s.reservedMemory), PoolMemory: s.AllocatablePool.MemoryBytes, ReservedMemory: s.reservedMemory, EmergencyMemory: scaleUint64Floor(s.AllocatablePool.MemoryBytes, s.Wm.EmergencyFactor)}
+	out := PressureSnapshot{HeadroomStable: now.Sub(p.lastReservationChange) >= p.policy.Interval, PressureRecord: p.record, RawZone: s.memoryZoneForReservedLocked(s.reservedMemory), PoolMemory: s.AllocatablePool.MemoryBytes, ReservedMemory: s.reservedMemory, EmergencyMemory: scaleUint64Floor(s.AllocatablePool.MemoryBytes, s.Wm.EmergencyFactor)}
 	for _, ob := range p.obligations {
 		switch ob.phase {
 		case "capturing":
@@ -522,9 +516,6 @@ func (s *State) PressureSnapshot() PressureSnapshot {
 		out.Protected, out.Beneficiary, out.Blocked = d.amount, d.sid, "memory_headroom"
 		if !d.memoryBlocked {
 			out.Blocked = "startup_or_rate"
-		}
-		if p.beneficiary == "host-safety" {
-			out.Blocked = "host_operational_margin"
 		}
 	}
 	if !p.holdSince.IsZero() {

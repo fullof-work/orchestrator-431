@@ -147,7 +147,7 @@ node-ctl resource pressure [--socket CONTROL_SOCKET]
 
 `status` shows node budget, host reserved, operational margin, allocatable pool, reserved memory, startup in-flight, zone and recovery counts. `list` shows each sandbox reservation. `drain` prevents new admission without altering live reservations.
 
-`pressure` queries `GET /internal/admin/resource-pressure` on the conductor control socket (or `NODE_CTL_SOCKET`), using the existing local admin authentication. It reports effective/RawZone, transition reason/version/time, R/P/E, hold remaining, protected funds, Q by phase, cleanup barriers, oldest wait, host safety pressure, per-sandbox pause reason/running interval, and a bounded recent operation history. The resource reservation protocol remains unchanged.
+`pressure` queries `GET /internal/admin/resource-pressure` on the conductor control socket (or `NODE_CTL_SOCKET`), using the existing local admin authentication. It reports effective/RawZone, transition reason/version/time, R/P/E, hold remaining, protected funds, Q by phase, cleanup barriers, oldest wait, per-sandbox pause reason/running interval, and a bounded recent operation history. The resource reservation protocol remains unchanged. The former `host_safety_blocked` diagnostic field is no longer reported; this query does not measure whole-host memory safety.
 
 `worker_blocked=no_eligible_running_sandbox` explains a pressure episode with
 no safe running candidate; the worker waits without releasing another owner's
@@ -246,6 +246,16 @@ StartupPool         = AllocatablePool * startup_factor
 
 NodeBudget is the current status/wire name for configured or discovered physical resources. Do not treat it as an amount from which HostReserved was already subtracted.
 
+On a shared host, configure `resources.physical_memory` and `host_reserved` to
+define this controller's assigned budget and leave room for other services.
+`physical_memory: auto` reads host `MemTotal` during configuration; capacity
+discovery does not establish exclusive ownership of the machine.
+OperationalMargin remains statically excluded from P for operational headroom.
+It is neither granted to sandboxes nor a threshold for host-wide availability.
+The runtime node loop does not sample host `MemAvailable` or infer its resource
+pool from memory left idle by unrelated services. Guest observations and the
+sandbox-local budget loop remain separate and unchanged.
+
 Resource subtraction saturates instead of underflowing. Individual reservation and aggregate updates occur in the same State critical section. Insertion/recovery replacement validates aggregate-addition overflow before modifying indices.
 
 ### 4.2 RawZone and effective Zone
@@ -288,8 +298,9 @@ Expired history restarts on a later request, and unused expired protection
 cannot block admission even before the next scan. Expiration never clears a
 reservation or recovery obligation. The local pressure query includes each
 demand's nonsecret age, amount and failure/critical round counts.
-A host MemAvailable sample below OperationalMargin is
-a separate safety input; it neither changes R nor grants the reserved margin.
+Only valid memory-blocked demands in the managed pool advance pressure rounds.
+Whole-host availability does not create a demand or authorize a resource Pause;
+a critical Zone without a qualifying demand does not itself authorize Pause.
 
 Q includes accepted capture intent, resource-pressure paused rows and their
 starting resumes. Q>0 keeps critical even when RawZone is green. Exit requires
@@ -299,6 +310,9 @@ Red requires RawZone below red continuously for its own hold before yellow;
 yellow requires continuously green RawZone for its hold before green. Rebound
 resets the hold. One evaluation performs at most one downgrade. Restart loads
 the journal and obligations before admission and restarts monotonic hold clocks.
+Historical transition reasons such as `host_operational_margin` remain labels,
+not reconstructed demands. Existing Q, cleanup barriers and reservation charges
+survive the policy change and follow the same recovery and stepwise exit rules.
 
 ### 4.3 Runtime grants
 
@@ -313,6 +327,10 @@ NewReservation = CurrentReservation + GrantedDelta
 ```
 
 Normal new growth uses actual `P-R-E`, less another selected waiter's unused protection; high urgency can use E but cannot exceed P. Effective red/critical does not itself deny runtime growth. Already-charged replay is reused without another charge or rate debit. One selected resume/grow demand protects released headroom until admission, executable progress, cancellation or expiration of an unused hold. Resume protection has priority over grow; a protection never subtracts a live reservation on cancellation.
+
+Starting capture or committing a paused row does not release grantable funds.
+Only a safe shrink or confirmed Release reduces R; the freed budget can then
+serve an eligible grow even while Q or an exit hold keeps effective critical.
 
 Partial grants are allowed. Sandboxer accumulates reservation first and deflates the balloon only when it can represent a larger Budget with a 64 MiB-aligned balloon target, so rounding cannot create unreserved memory. Budget boundaries are relative to Capacity: at Capacity 1056 MiB they are 32/96/160/224/... MiB. A grant from 160 to 192 MiB retains the demand and protects the remaining 32 MiB; reaching 224 MiB is executable progress and clears that demand. Capacity itself need not be aligned.
 
@@ -421,7 +439,9 @@ node must not require global allocation silence to recover an unattended sandbox
 Sandboxer subsequently supplies exact I, and final resource admission waits for
 its complete budget before VM start; the pacing timer does not grant memory.
 Starting remains in Q until actual running commit. The minimum running window
-limits immediate re-eviction, with an override for observed host safety pressure.
+limits immediate re-eviction. If all otherwise eligible candidates remain in
+that window, selection waits for it to expire; host-wide availability cannot
+bypass the configured protection.
 A valid demand can coordinate further Pause while effective Zone stays critical;
 recovery never waits for a downgrade that Q itself prevents. Missing/corrupt
 artifacts, full/slow storage and capacity failures retain the obligation/source
@@ -446,8 +466,10 @@ Physical release checks distinguish the old VMM's shared-memory charge from
 Snapshot file cache. After the old process exits, disk-backed Snapshot pages
 may remain cached or dirty; `MemFree` need not rise by the old charge. Observe
 the old process/cgroup identity, confirmed reservation release, host
-`MemAvailable` and storage writeback separately. The node never treats a
-Snapshot's file length or a predicted guest working set as released headroom.
+`MemAvailable` and storage writeback separately during isolated validation.
+These whole-host measurements are test diagnostics, not node control inputs.
+The node never treats a Snapshot's file length or a predicted guest working set
+as released headroom.
 
 Sandbox fields and the small transition journal share the existing SQLite
 owner. The node restores them with resource inventory before serving. Resource

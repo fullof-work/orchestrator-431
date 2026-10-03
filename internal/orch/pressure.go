@@ -336,7 +336,6 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 	resumeAfter := time.Now().Add(p.policy.Interval)
 	backoff := map[string]time.Time{}
 	var persisted uint64 = ^uint64(0)
-	var hostSampleAt time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -358,14 +357,6 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 			if r.err != nil {
 				backoff[r.sid] = time.Now().Add(max(p.policy.Interval, 2*time.Second))
 				o.log.Warn("node pressure operation blocked", "sid", r.sid, "pause", r.pause, "err", r.err)
-			}
-		}
-		if time.Since(hostSampleAt) >= p.policy.Interval {
-			hostSampleAt = time.Now()
-			if available, err := nodectl.ReadHostAvailable(); err == nil {
-				p.state.ObserveHostAvailable(available)
-			} else {
-				o.log.Warn("host pressure sample unavailable", "err", err)
 			}
 		}
 		rows := o.pressureSandboxes()
@@ -495,7 +486,7 @@ func pressurePauseCandidate(rows []*types.Sandbox, snapshot nodectl.PressureSnap
 		if sb.State != types.StateRunning || sb.ResourceObligation || sb.ID == snapshot.Beneficiary || now.Before(backoff[sb.ID]) || !eligible(sb.ID) {
 			continue
 		}
-		if !snapshot.HostSafety && (sb.RunningSinceUnixNano == 0 || now.Sub(time.Unix(0, sb.RunningSinceUnixNano)) < minimum) {
+		if sb.RunningSinceUnixNano == 0 || now.Sub(time.Unix(0, sb.RunningSinceUnixNano)) < minimum {
 			continue
 		}
 		return sb

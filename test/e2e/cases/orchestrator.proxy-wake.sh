@@ -100,15 +100,15 @@ for row in json.load(sys.stdin) or []:
         except OSError: out[name] = "absent"
     print(json.dumps(out, sort_keys=True))
 '
-    python3 - "$WORK" <<'PY_DIAG'
+    python3 - "$WORK" "$EXECUTE_RUN_ROOT" <<'PY_DIAG'
 from pathlib import Path
 import json, sys, yaml
-work = Path(sys.argv[1]); section = False
+work = Path(sys.argv[1]); run_root = Path(sys.argv[2]); section = False
 for line in (work / "config.yaml").read_text().splitlines():
     if line == "resource_listen:": section = True
     elif line and not line[0].isspace(): section = False
     if section: print(line)
-for path in (work / "run/sandboxes").glob("*/*.yaml"):
+for path in (run_root / "sandboxes").glob("*/*.yaml"):
     config = yaml.safe_load(path.read_text()); resource = config.get("resources", {})
     projection = {key: resource.get(key) for key in ("capacity", "allocatable", "startup", "overhead", "watermark_high")}
     projection["controller"] = resource.get("control", {}).get("controller")
@@ -299,17 +299,17 @@ done
 # Heap allocation can finish through balloon self-deflation before its node
 # Budget catches up. Establish a satisfied, eligible oldest consumer first;
 # otherwise it is legitimately the beneficiary and the newer guest is paused.
-python3 - "$BIN" "$WORK" "$FIRST" <<'PY_SATISFIED' || fail "first held workload did not obtain its real Budget/headroom"
+python3 - "$BIN" "$WORK" "$EXECUTE_RUN_ROOT" "$FIRST" <<'PY_SATISFIED' || fail "first held workload did not obtain its real Budget/headroom"
 import json, subprocess, sys, time
 from pathlib import Path
-binary, directory, sid = sys.argv[1:]; work = Path(directory)
+binary, directory, runtime, sid = sys.argv[1:]; work = Path(directory); run_root = Path(runtime)
 end = time.monotonic() + 40
 last = None
 while time.monotonic() < end:
     rows = json.loads(subprocess.check_output([binary + "/node-ctl", "resource", "list", "--socket", str(work / "sandbox-resource.sock")], timeout=5)) or []
     row = next(r for r in rows if r["sandbox_id"] == sid)
-    info = json.loads(subprocess.check_output(["curl", "-fsS", "--max-time", "2", "--unix-socket", str(work / "run/sandboxes" / sid / "ch.sock"), "http://localhost/api/v1/vm.info"], timeout=3))
-    mem = subprocess.check_output([binary + "/sandbox-ctl", "exec", "--run-root", str(work / "run/sandboxes"), "--sandbox-id", sid, "--", "/bin/cat", "/proc/meminfo"], timeout=5).decode()
+    info = json.loads(subprocess.check_output(["curl", "-fsS", "--max-time", "2", "--unix-socket", str(run_root / "sandboxes" / sid / "ch.sock"), "http://localhost/api/v1/vm.info"], timeout=3))
+    mem = subprocess.check_output([binary + "/sandbox-ctl", "exec", "--run-root", str(run_root / "sandboxes"), "--sandbox-id", sid, "--", "/bin/cat", "/proc/meminfo"], timeout=5).decode()
     available = next(int(line.split()[1]) * 1024 for line in mem.splitlines() if line.startswith("MemAvailable:"))
     last = dict(reservation=row["allocatable_memory"], actual=info["memory_actual_size"], target_budget=(1<<30)-info["config"]["balloon"]["size"], available=available, stage=row["stage"])
     # Actual can remain above target after guest self-deflation. The existing
@@ -424,10 +424,10 @@ curl -sS --noproxy '*' --max-time 120 -o "$WORK/pressure-connect.body" -w '%{htt
     --data '{"timeout":600}' "http://127.0.0.1:$PORT/sandboxes/$SECOND/connect" > "$WORK/pressure-connect.code" &
 PRESSURE_CONNECT_PID=$!
 PIDS+=("$PRESSURE_CONNECT_PID")
-python3 - "$BIN" "$WORK" "$FIRST" "$SECOND" <<'PY_ROTATION' || fail "unattended pressure rotation did not preserve both primary workloads"
+python3 - "$BIN" "$WORK" "$EXECUTE_RUN_ROOT" "$FIRST" "$SECOND" <<'PY_ROTATION' || fail "unattended pressure rotation did not preserve both primary workloads"
 import json, sqlite3, subprocess, sys, time
 from pathlib import Path
-binary, directory, first, second = sys.argv[1:]; work = Path(directory)
+binary, directory, runtime, first, second = sys.argv[1:]; work = Path(directory); run_root = Path(runtime)
 ids = (first, second); seen = {sid: {} for sid in ids}; running_since = {}
 expected = {first: json.loads((work / "pressure-before.json").read_text())["nonce"]}
 start = time.monotonic(); deadline = start + 180; last = None
@@ -447,7 +447,7 @@ with (work / "pressure-rotation.log").open("w") as output:
                 assert since > max((stamp for rid, stamp in running_since.items() if rid in seen[sid]), default=0), (sid, since, running_since)
                 running_since[run_id] = since
             try:
-                result = subprocess.run([binary + "/sandbox-ctl", "exec", "--run-root", str(work / "run/sandboxes"), "--sandbox-id", sid, "--", "/bin/cat", "/tmp/pressure-state.json"], capture_output=True, timeout=3)
+                result = subprocess.run([binary + "/sandbox-ctl", "exec", "--run-root", str(run_root / "sandboxes"), "--sandbox-id", sid, "--", "/bin/cat", "/tmp/pressure-state.json"], capture_output=True, timeout=3)
                 if result.returncode: continue  # capture can win this read-only probe
                 held = json.loads(result.stdout)
             except (subprocess.TimeoutExpired, json.JSONDecodeError): continue

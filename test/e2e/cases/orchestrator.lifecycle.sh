@@ -10,7 +10,7 @@ build_ready_template
 
 # #426 real process-owner acceptance, retained after the unified-case migration.
 runner_lifecycle_check() {
-    python3 "$E2E_LIB/orchestrator/runner_lifecycle.py" "$1" "$WORK" "$2" "$RUNNER_PREFIX" "$3" "${@:4}"
+    python3 "$E2E_LIB/orchestrator/runner_lifecycle.py" --run-root "$EXECUTE_RUN_ROOT" "$1" "$WORK" "$2" "$RUNNER_PREFIX" "$3" "${@:4}"
 }
 run_runner_exit_case() { # $1=static|controller, $2=ch|runtime|parent, $3=template
     local mode="$1" role="$2" template="$3" body code sid token before started ready_ms killed cleanup_ms runtime_pid

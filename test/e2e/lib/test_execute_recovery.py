@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import secrets
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -223,7 +224,7 @@ execute_state_recover "$2"
         disk = self.root / "disk temporary files"
         disk.mkdir()
         moved = disk / self.run_key
-        self.work.rename(moved)
+        shutil.move(str(self.work), str(moved))
         self.work = moved
         environment = {"TMPDIR": str(disk)}
         self.record(extra_env=environment)
@@ -238,7 +239,7 @@ execute_state_recover "$2"
         disk = self.root / "disk"
         disk.mkdir()
         moved = disk / self.run_key
-        self.work.rename(moved)
+        shutil.move(str(self.work), str(moved))
         self.work = moved
         environment = {"TMPDIR": str(disk)}
         self.record("-", extra_env=environment)
@@ -266,7 +267,7 @@ execute_state_finish "$2" "$(cat "$KUASAR_EXECUTE_STATE_PATH")"
         disk = self.root / "disk"
         disk.mkdir()
         moved = disk / self.run_key
-        self.work.rename(moved)
+        shutil.move(str(self.work), str(moved))
         self.work = moved
         self.record(extra_env={"TMPDIR": str(disk)})
         self.install_owned_resources()

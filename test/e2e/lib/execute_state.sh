@@ -31,11 +31,37 @@ execute_state_record() { # run-key work switch switch-netns proxy-netns host-vet
         "$proxy_veth_host" "$proxy_veth_ns" "$run_key" "$run_key" "$original_forward"
 }
 
+# The caller supplies TMPDIR (workbench uses disk-backed /build/tmp). Record
+# its physical path so creation and later ownership validation agree. The
+# sentinel preserves trailing newlines until the TSV delimiter check rejects them.
+execute_state_work_root() {
+    local root
+    root="$(CDPATH= cd -P -- "${TMPDIR:-/tmp}" && printf '%s.' "$PWD")" \
+        || { echo "execute temporary root is unavailable" >&2; return 1; }
+    root="${root%.}"
+    case "$root" in
+        *$'\t'*|*$'\n'*) echo "invalid execute temporary root" >&2; return 1 ;;
+    esac
+    printf '%s\n' "$root"
+}
+
+execute_state_create_work() {
+    local root
+    root="$(execute_state_work_root)" || return 1
+    mktemp -d "${root%/}/e-XXXXXX"
+}
+
 execute_state_validate_fields() {
     [[ "$EXECUTE_STATE_RUN_KEY" =~ ^e-[A-Za-z0-9]{6}$ ]] \
         || { echo "invalid execute recovery run key" >&2; return 1; }
-    [ "$EXECUTE_STATE_WORK" = "/tmp/$EXECUTE_STATE_RUN_KEY" ] \
-        || { echo "invalid execute recovery work directory" >&2; return 1; }
+    # Keep legacy /tmp records recoverable. New locations must be the exact
+    # run directory under the caller's configured root, never an arbitrary path.
+    if [ "$EXECUTE_STATE_WORK" != "/tmp/$EXECUTE_STATE_RUN_KEY" ]; then
+        local root
+        root="$(execute_state_work_root)" || return 1
+        [ "$EXECUTE_STATE_WORK" = "${root%/}/$EXECUTE_STATE_RUN_KEY" ] \
+            || { echo "invalid execute recovery work directory" >&2; return 1; }
+    fi
     local name
     for name in "$EXECUTE_STATE_SWITCH" "$EXECUTE_STATE_SWITCH_NETNS" \
         "$EXECUTE_STATE_PROXY_NETNS" "$EXECUTE_STATE_PROXY_VETH_HOST" \

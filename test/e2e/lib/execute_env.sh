@@ -81,7 +81,7 @@ BUILDER_CPU="$(nproc)"
 
 : "${WORK:?WORK must be supplied by the common runner}"
 CASE_OUT="${OUT:-$WORK}"
-WORK="$(mktemp -d /tmp/e-XXXXXX)"
+WORK="$(execute_state_create_work)"
 RUN_KEY="${WORK##*/}"
 SWITCH="${SWITCH:-x${RUN_KEY#e-}}"
 SW_NETNS="${SW_NETNS:-${RUN_KEY}-sw}"

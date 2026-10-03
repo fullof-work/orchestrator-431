@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import secrets
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -91,12 +92,12 @@ esac
             self.fail(f"shell failed ({result.returncode}):\nstdout={result.stdout}\nstderr={result.stderr}")
         return result
 
-    def record(self, original_forward="0"):
+    def record(self, original_forward="0", *, extra_env=None):
         result = self.bash(
-            f'execute_state_reserve {self.run_key} {self.work} {self.switch} '
-            f'{self.switch_netns} {self.proxy_netns} {self.proxy_host} {self.proxy_peer} '
-            f'{original_forward}\n',
-            check=True,
+            shlex.join(["execute_state_reserve", self.run_key, str(self.work), self.switch,
+                        self.switch_netns, self.proxy_netns, self.proxy_host, self.proxy_peer,
+                        original_forward]) + "\n",
+            check=True, extra_env=extra_env,
         )
         self.assertEqual(result.stdout, "")
 
@@ -176,6 +177,111 @@ sysctl() {
 kill() { printf 'kill %s\n' "$*" >> "$COMMAND_LOG"; }
 execute_state_recover "$2"
 '''
+
+    def create_work(self, tmpdir, prefix=""):
+        assignment = next(line for line in ENV.read_text().splitlines()
+                          if line.startswith('WORK="$('))
+        return self.bash(prefix + assignment + '\nprintf "%s\\n" "$WORK"\nrmdir -- "$WORK"\n',
+                         extra_env={"TMPDIR": str(tmpdir)})
+
+    def test_work_directory_honors_canonical_tmpdir(self):
+        disk = self.root / "disk temporary files"
+        disk.mkdir()
+        alias = self.root / "alias"
+        alias.symlink_to(disk, target_is_directory=True)
+        created = self.create_work(str(alias) + "/")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        path = Path(created.stdout.strip())
+        self.assertEqual(path.parent, disk.resolve())
+        self.assertRegex(path.name, r"^e-[A-Za-z0-9]{6}$")
+        self.assertFalse(path.exists())
+
+    def test_empty_tmpdir_retains_default_short_root(self):
+        created = self.create_work("")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        self.assertEqual(Path(created.stdout.strip()).parent, Path("/tmp").resolve())
+
+    def test_invalid_tmpdir_fails_before_allocation(self):
+        marker = self.root / "mktemp-called"
+        file_root = self.root / "not-directory"
+        file_root.touch()
+        tab_root = self.root / "tab\troot"
+        tab_root.mkdir()
+        newline_root = self.root / "newline-root\n"
+        newline_root.mkdir()
+        alias = self.root / "newline-alias"
+        alias.symlink_to(newline_root, target_is_directory=True)
+        prefix = 'mktemp() { printf called > "$FIXTURE/mktemp-called"; return 23; }\n'
+        for invalid in (self.root / "absent", file_root, tab_root, newline_root, alias):
+            with self.subTest(tmpdir=str(invalid)):
+                marker.unlink(missing_ok=True)
+                failed = self.create_work(invalid, prefix)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertFalse(marker.exists(), "invalid root must fail before calling mktemp")
+
+    def test_configured_disk_root_survives_record_and_recovery(self):
+        disk = self.root / "disk temporary files"
+        disk.mkdir()
+        moved = disk / self.run_key
+        self.work.rename(moved)
+        self.work = moved
+        environment = {"TMPDIR": str(disk)}
+        self.record(extra_env=environment)
+        self.install_owned_resources()
+        recovered = self.bash(self.recovery_harness(), extra_env=environment)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(self.work.exists())
+        self.assertFalse(self.state.exists())
+        self.assertTrue((self.root / "unit-sandbox-runner@foreign.service").exists())
+
+    def test_configured_disk_root_normal_finish_keeps_work_and_clears_state(self):
+        disk = self.root / "disk"
+        disk.mkdir()
+        moved = disk / self.run_key
+        self.work.rename(moved)
+        self.work = moved
+        environment = {"TMPDIR": str(disk)}
+        self.record("-", extra_env=environment)
+        finished = self.bash(r'''
+ip() { case "$1 $2" in 'netns list') : ;; 'link show') return 1 ;; esac; }
+iptables() { return 1; }
+systemctl() { [ "$1" != list-units ] || :; }
+execute_state_finish "$2" "$(cat "$KUASAR_EXECUTE_STATE_PATH")"
+''', extra_env=environment)
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertFalse(self.state.exists())
+        self.assertTrue(self.work.exists())
+
+    def test_legacy_tmp_record_recovers_with_new_tmpdir(self):
+        disk = self.root / "disk"
+        disk.mkdir()
+        self.record()
+        self.install_owned_resources()
+        recovered = self.bash(self.recovery_harness(), extra_env={"TMPDIR": str(disk)})
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(self.work.exists())
+        self.assertFalse(self.state.exists())
+
+    def test_recovery_rejects_other_roots_and_noncanonical_paths_before_cleanup(self):
+        disk = self.root / "disk"
+        disk.mkdir()
+        moved = disk / self.run_key
+        self.work.rename(moved)
+        self.work = moved
+        self.record(extra_env={"TMPDIR": str(disk)})
+        self.install_owned_resources()
+        fields = self.state.read_text().rstrip("\n").split("\t")
+        for path in (self.root / self.run_key, disk / ".." / self.run_key,
+                     disk / "nested" / self.run_key, self.work / "child"):
+            with self.subTest(work=str(path)):
+                fields[2] = str(path)
+                self.state.write_text("\t".join(fields) + "\n")
+                failed = self.bash(self.recovery_harness(), extra_env={"TMPDIR": str(disk)})
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn("invalid execute recovery work directory", failed.stderr)
+                self.assertFalse(self.log.exists(), "invalid state must not begin resource cleanup")
+                self.assertTrue(self.work.exists())
+                self.assertTrue(self.state.exists())
 
     def test_no_state_is_a_noop_even_without_connector_binary(self):
         result = self.bash('execute_state_recover /does/not/exist\n')

@@ -60,6 +60,6 @@ echo "==> PASS: Proxy worker reached sandbox floatingip:8000 from proxy_netns (m
 code=$(req DELETE "/sandboxes/$SID" "$AK")
 [ "$code" = 204 ] || fail "delete=$code"
 wait_sandbox_state "$SID" missing 120 || fail "delete finalizer retained row"
-[ ! -e "$WORK/run/sandboxes/$SID" ] && [ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "delete retained owned directories"
+[ ! -e "$EXECUTE_RUN_ROOT/sandboxes/$SID" ] && [ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "delete retained owned directories"
 [ -f "$WORK/lib/node-ctl.db" ] && [ -S "$WORK/node-ctl.socket" ] || fail "finalizer removed node files"
 echo "PASS orchestrator.exec.sh"

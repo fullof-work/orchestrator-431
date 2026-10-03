@@ -120,8 +120,8 @@ PY_DIAG
     for sid in "${FIRST:-}" "${SECOND:-}" "${PRESSURE_SID:-}"; do
         [ -n "$sid" ] || continue
         echo "==> guest memory/state sid=$sid"
-        timeout 5 "$BIN/sandbox-ctl" exec --run-root "$WORK/run/sandboxes" --sandbox-id "$sid" -- /bin/cat /proc/meminfo /tmp/pressure-state.json
-        timeout 5 curl -fsS --unix-socket "$WORK/run/sandboxes/$sid/ch.sock" http://localhost/api/v1/vm.info |
+        timeout 5 "$BIN/sandbox-ctl" exec --run-root "$EXECUTE_RUN_ROOT/sandboxes" --sandbox-id "$sid" -- /bin/cat /proc/meminfo /tmp/pressure-state.json
+        timeout 5 curl -fsS --unix-socket "$EXECUTE_RUN_ROOT/sandboxes/$sid/ch.sock" http://localhost/api/v1/vm.info |
             python3 -c 'import json,sys; v=json.load(sys.stdin); print(json.dumps({"memory_actual_size":v.get("memory_actual_size"), "balloon":v.get("config",{}).get("balloon")}))'
         echo "==> guest/controller journal sid=$sid"
         timeout 5 journalctl "KUASAR_SANDBOX_ID=$sid" --no-pager -n 200 -o cat |
@@ -284,12 +284,12 @@ PY_CREATE
     wait_sandbox_state "$PRESSURE_SID" running 600 || fail "pressure primary did not start"
 }
 pressure_guest_state() {
-    "$BIN/sandbox-ctl" exec --run-root "$WORK/run/sandboxes" --sandbox-id "$1" -- /bin/cat /tmp/pressure-state.json
+    "$BIN/sandbox-ctl" exec --run-root "$EXECUTE_RUN_ROOT/sandboxes" --sandbox-id "$1" -- /bin/cat /tmp/pressure-state.json
 }
 pressure_create 384
 FIRST=$PRESSURE_SID
 FIRST_KAT=$(issue_exec_session "$FIRST" "$AK" "{\"conditions\":[{\"expr\":\"request.argv[0] == '/bin/sh'\"}]}")
-"$BIN/sandbox-ctl" exec --run-root "$WORK/run/sandboxes" --sandbox-id "$FIRST" -- /bin/touch /tmp/pressure.start
+"$BIN/sandbox-ctl" exec --run-root "$EXECUTE_RUN_ROOT/sandboxes" --sandbox-id "$FIRST" -- /bin/touch /tmp/pressure.start
 ready=""
 for _ in $(seq 1 300); do
     if pressure_guest_state "$FIRST" > "$WORK/pressure-before.json" 2>/dev/null; then ready=1; break; fi
@@ -327,7 +327,7 @@ printf '%s\n' "$FIRST" > "$PAUSE_BARRIER_TARGET"
 rm -f "$PAUSE_BARRIER_REACHED" "$PAUSE_BARRIER_RELEASE"
 pressure_create 576
 SECOND=$PRESSURE_SID
-"$BIN/sandbox-ctl" exec --run-root "$WORK/run/sandboxes" --sandbox-id "$SECOND" -- /bin/touch /tmp/pressure.start
+"$BIN/sandbox-ctl" exec --run-root "$EXECUTE_RUN_ROOT/sandboxes" --sandbox-id "$SECOND" -- /bin/touch /tmp/pressure.start
 pressure_deadline=$((SECONDS + 60))
 pressure_next_sample=$SECONDS
 while [ ! -e "$PAUSE_BARRIER_REACHED" ] && [ "$SECONDS" -lt "$pressure_deadline" ]; do

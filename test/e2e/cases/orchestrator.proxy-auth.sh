@@ -31,7 +31,7 @@ code=$(req POST /sandboxes "$AK" "$IDENTITY_CREATE_BODY")
 unset REQ_ATTACH_MMDS
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo; dump_logs
-    SID=$(ls "$WORK/run/sandboxes" 2>/dev/null | head -1)
+    SID=$(ls "$EXECUTE_RUN_ROOT/sandboxes" 2>/dev/null | head -1)
     [ -n "$SID" ] && { echo "==> sandbox journal:"; journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 60 2>/dev/null | sed 's/^/  sandbox| /'; }
     fail "create=$code (want 201)"
 fi
@@ -106,7 +106,7 @@ echo "==> PASS: static resource stats observes VMM memory/CPU with controller, u
 native_traffic_probe 0
 echo "==> PASS: conductor native traffic reads work while telemetry is stopped"
 
-ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
+ENVD_SOCK="$EXECUTE_RUN_ROOT/sandboxes/$SID/envd.sock"
 for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.25; done
 [ -S "$ENVD_SOCK" ] || fail "envd.sock not found at $ENVD_SOCK"
 ok=""

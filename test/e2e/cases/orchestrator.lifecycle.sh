@@ -206,7 +206,7 @@ unset REQ_NET_HEADER REQ_ATTACH_MMDS
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo
     echo "==> orchestrator log:"; sed 's/^/  orch| /' "$WORK/orch.log"
-    SID=$(ls "$WORK/run/sandboxes" 2>/dev/null | head -1)
+    SID=$(ls "$EXECUTE_RUN_ROOT/sandboxes" 2>/dev/null | head -1)
     [ -n "$SID" ] && { echo "==> sandbox journal:"; journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 60 2>/dev/null | sed 's/^/  sandbox| /'; }
     fail "create=$code (want 201 durable acceptance)"
 fi
@@ -217,7 +217,7 @@ assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed 
 CREATE_RETURN_STATE="$(sandbox_state "$SID")"
 case "$CREATE_RETURN_STATE" in starting|running) ;; *) fail "state immediately after 201=$CREATE_RETURN_STATE";; esac
 echo "==> PASS: Create 201 durably accepted sandbox $SID (observed state=$CREATE_RETURN_STATE)"
-python3 - "$WORK/lib/node-ctl.db" "$SID" "$WORK/run/sandboxes/$SID" "$WORK/lib/sandboxes/$SID" <<'PY' \
+python3 - "$WORK/lib/node-ctl.db" "$SID" "$EXECUTE_RUN_ROOT/sandboxes/$SID" "$WORK/lib/sandboxes/$SID" <<'PY' \
     || fail "durable Sandbox RunDir/BaseDir layout"
 import sqlite3, sys
 with sqlite3.connect(sys.argv[1], timeout=5) as db:
@@ -244,14 +244,14 @@ code=$(cat "$WORK/immediate-data.code")
 wait_sandbox_state "$SID" running 20 || fail "sandbox was not running after parked data request"
 wait_proxy_traffic_stats "$SID" idle || fail "Proxy traffic did not converge to idle"
 wait_resource_stats "$SID" || fail "controller resource stats were not reported"
-assert_resolved_resource_yaml "$WORK/run/sandboxes/$SID/$SID.yaml" 2560MiB 2560MiB "$WORK/sandbox-resource.sock" \
+assert_resolved_resource_yaml "$EXECUTE_RUN_ROOT/sandboxes/$SID/$SID.yaml" 2560MiB 2560MiB "$WORK/sandbox-resource.sock" \
     || fail "snapshot restore resource YAML did not preserve capacity and target-node defaults"
 assert_resource_lease "$SID" 2684354560 268435456 2684354560 \
     || fail "snapshot restore lease did not match generated YAML"
 [ -f "$WORK/lib/sandboxes/$SID/$SID.overlay.diff" ] \
     || fail "Sandbox writable diff is outside BaseDir or lost logical SandboxID filename"
-if find "$WORK/run/sandboxes/$SID" -type f \( -name '*.img' -o -name '*.diff' -o -name '*.sandbox' -o -name '*.snapshot' \) -print -quit | grep -q .; then
-    find "$WORK/run/sandboxes/$SID" -type f -print >&2
+if find "$EXECUTE_RUN_ROOT/sandboxes/$SID" -type f \( -name '*.img' -o -name '*.diff' -o -name '*.sandbox' -o -name '*.snapshot' \) -print -quit | grep -q .; then
+    find "$EXECUTE_RUN_ROOT/sandboxes/$SID" -type f -print >&2
     fail "Sandbox RunDir contains a large image/diff/checkpoint artifact"
 fi
 echo "==> PASS: post-Create data request was reported parking through readiness, then idle; resource stats are live (code=$code)"
@@ -276,6 +276,6 @@ echo "==> PASS: sandbox detail/info returned RFC3339 timestamps and resource fie
 code=$(req DELETE "/sandboxes/$SID" "$AK")
 [ "$code" = 204 ] || fail "delete=$code"
 wait_sandbox_state "$SID" missing 120 || fail "delete finalizer retained row"
-[ ! -e "$WORK/run/sandboxes/$SID" ] && [ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "delete retained owned directories"
+[ ! -e "$EXECUTE_RUN_ROOT/sandboxes/$SID" ] && [ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "delete retained owned directories"
 [ -f "$WORK/lib/node-ctl.db" ] && [ -S "$WORK/node-ctl.socket" ] || fail "finalizer removed node files"
 echo "PASS orchestrator.lifecycle.sh"

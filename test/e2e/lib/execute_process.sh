@@ -30,7 +30,7 @@ $MMDS_ROUTES_CONFIG
 $MMDS_SERVICES_CONFIG
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
-paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
+paths: { run_root: $EXECUTE_RUN_ROOT, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
 units:
   dir: $UNIT_DIR
   # Identical entries remain independent round-robin positions across cold,
@@ -85,7 +85,7 @@ start_orchestrator() { # $1=log path
     [ -n "$ready" ] || { sed 's/^/  /' "$log_path"; fail "orchestrator health did not become ready"; }
 
     write_proxy_config "$WORK/proxy.yaml" \
-        "$WORK/node-ctl.socket" "$WORK/run" "127.0.0.1:$PROXY_PORT" \
+        "$WORK/node-ctl.socket" "$EXECUTE_RUN_ROOT" "127.0.0.1:$PROXY_PORT" \
         "$PROXY_NETNS" "$WORK/proxy-stats.sock" "$WORK/proxy-routes.shm" \
         1024 2 enforce 120s "${PROXY_METRICS_LISTEN:--}" - - "${PROXY_EXECUTABLE:--}"
     # Preserve the pre-start namespace identity and addresses so a failed bind

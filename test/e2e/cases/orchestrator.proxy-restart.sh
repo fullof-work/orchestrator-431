@@ -30,7 +30,7 @@ build_image_template
 # Every Create requires the current Proxy registration and its route-applied
 # barrier. Removing the master must fail admission before any launch ownership
 # or durable sandbox state is retained.
-{ find "$WORK/run/sandboxes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true; } \
+{ find "$EXECUTE_RUN_ROOT/sandboxes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true; } \
     | sort >"$WORK/run-dirs.before-unavailable"
 "$BIN/connector-ctl" vswitch status "$SWITCH" >"$WORK/vswitch.before-unavailable.json"
 python3 - "$WORK/vswitch.before-unavailable.json" <<'PY' >"$WORK/vswitch-ports.before-unavailable"
@@ -48,7 +48,7 @@ python3 - "$WORK/resp.body" <<'PY' || fail "unavailable Create retained durable/
 import json, sys
 assert json.load(open(sys.argv[1])) == []
 PY
-{ find "$WORK/run/sandboxes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true; } \
+{ find "$EXECUTE_RUN_ROOT/sandboxes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true; } \
     | sort >"$WORK/run-dirs.after-unavailable"
 cmp -s "$WORK/run-dirs.before-unavailable" "$WORK/run-dirs.after-unavailable" \
     || fail "unavailable Create allocated a sandbox run directory"
@@ -63,7 +63,7 @@ systemctl list-units --all --type=service --no-legend --no-pager "${RUNNER_PREFI
     | sort >"$WORK/runners.after-unavailable"
 cmp -s "$WORK/runners.before-unavailable" "$WORK/runners.after-unavailable" \
     || fail "unavailable Create assigned a sandbox runner"
-if ps -eo args= | grep -F 'cloud-hypervisor' | grep -F "$WORK/run" >/dev/null; then
+if ps -eo args= | grep -F 'cloud-hypervisor' | grep -F "$EXECUTE_RUN_ROOT" >/dev/null; then
     fail "unavailable Create started a VMM"
 fi
 echo "==> PASS: Proxy absent -> Create 503 with no durable/cache/run-dir/runner/VMM side effect"

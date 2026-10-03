@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 import secrets
+import re
+import socket
 import shlex
 import shutil
 import stat
@@ -27,10 +29,11 @@ class ExecuteRecovery(unittest.TestCase):
             self.run_key = "e-" + secrets.token_hex(3)
             self.work = Path("/tmp") / self.run_key
             try:
-                self.work.mkdir()
+                self.work.mkdir(mode=0o700)
                 break
             except FileExistsError:
                 pass
+        self.runtime = self.work
         self.switch = "x" + self.run_key.removeprefix("e-")
         self.switch_netns = self.run_key + "-sw"
         self.proxy_netns = self.run_key + "-proxy"
@@ -69,6 +72,11 @@ esac
                 else:
                     path.unlink()
             self.work.rmdir()
+        if self.runtime != self.work:
+            if self.runtime.is_symlink():
+                self.runtime.unlink()
+            elif self.runtime.exists():
+                shutil.rmtree(self.runtime)
         self.fixture.cleanup()
 
     def env(self):
@@ -93,11 +101,11 @@ esac
             self.fail(f"shell failed ({result.returncode}):\nstdout={result.stdout}\nstderr={result.stderr}")
         return result
 
-    def record(self, original_forward="0", *, extra_env=None):
+    def record(self, original_forward="0", *, extra_env=None, version="v2"):
         result = self.bash(
             shlex.join(["execute_state_reserve", self.run_key, str(self.work), self.switch,
                         self.switch_netns, self.proxy_netns, self.proxy_host, self.proxy_peer,
-                        original_forward]) + "\n",
+                        original_forward, version]) + "\n",
             check=True, extra_env=extra_env,
         )
         self.assertEqual(result.stdout, "")
@@ -182,7 +190,8 @@ execute_state_recover "$2"
     def create_work(self, tmpdir, prefix=""):
         assignment = next(line for line in ENV.read_text().splitlines()
                           if line.startswith('WORK="$('))
-        return self.bash(prefix + assignment + '\nprintf "%s\\n" "$WORK"\nrmdir -- "$WORK"\n',
+        cleanup = '\nrmdir -- "$WORK"\n[ "$WORK" = "/tmp/${WORK##*/}" ] || rmdir -- "/tmp/${WORK##*/}"\n'
+        return self.bash(prefix + assignment + '\nprintf "%s\\n" "$WORK"' + cleanup,
                          extra_env={"TMPDIR": str(tmpdir)})
 
     def test_work_directory_honors_canonical_tmpdir(self):
@@ -224,7 +233,7 @@ execute_state_recover "$2"
         disk = self.root / "disk temporary files"
         disk.mkdir()
         moved = disk / self.run_key
-        shutil.move(str(self.work), str(moved))
+        shutil.copytree(self.work, moved)
         self.work = moved
         environment = {"TMPDIR": str(disk)}
         self.record(extra_env=environment)
@@ -239,7 +248,7 @@ execute_state_recover "$2"
         disk = self.root / "disk"
         disk.mkdir()
         moved = disk / self.run_key
-        shutil.move(str(self.work), str(moved))
+        shutil.copytree(self.work, moved)
         self.work = moved
         environment = {"TMPDIR": str(disk)}
         self.record("-", extra_env=environment)
@@ -256,7 +265,7 @@ execute_state_finish "$2" "$(cat "$KUASAR_EXECUTE_STATE_PATH")"
     def test_legacy_tmp_record_recovers_with_new_tmpdir(self):
         disk = self.root / "disk"
         disk.mkdir()
-        self.record()
+        self.record(version="v1")
         self.install_owned_resources()
         recovered = self.bash(self.recovery_harness(), extra_env={"TMPDIR": str(disk)})
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
@@ -267,7 +276,7 @@ execute_state_finish "$2" "$(cat "$KUASAR_EXECUTE_STATE_PATH")"
         disk = self.root / "disk"
         disk.mkdir()
         moved = disk / self.run_key
-        shutil.move(str(self.work), str(moved))
+        shutil.copytree(self.work, moved)
         self.work = moved
         self.record(extra_env={"TMPDIR": str(disk)})
         self.install_owned_resources()
@@ -283,6 +292,105 @@ execute_state_finish "$2" "$(cat "$KUASAR_EXECUTE_STATE_PATH")"
                 self.assertFalse(self.log.exists(), "invalid state must not begin resource cleanup")
                 self.assertTrue(self.work.exists())
                 self.assertTrue(self.state.exists())
+
+    def test_long_disk_root_keeps_real_maximum_socket_path_short(self):
+        disk = self.root / ("long-disk-root-" + "d" * 30)
+        disk.mkdir()
+        lines = ENV.read_text().splitlines()
+        setup = next(line for line in lines if line.startswith('WORK="$(')) + '\n'
+        setup += next(line for line in lines if line.startswith('RUN_KEY=')) + '\n'
+        # Old fixture derives run_root from WORK; the new fixture separates it.
+        setup += next((line for line in lines if line.startswith('EXECUTE_RUN_ROOT=')),
+                      'EXECUTE_RUN_ROOT="$WORK/run"') + '\n'
+        result = self.bash(setup + 'printf "%s\\n" "$WORK" "$EXECUTE_RUN_ROOT"\n',
+                           extra_env={"TMPDIR": str(disk)}, check=True)
+        work, run = map(Path, result.stdout.splitlines())
+        self.addCleanup(lambda: shutil.rmtree(work, ignore_errors=True))
+        self.addCleanup(lambda: shutil.rmtree(Path('/tmp') / work.name, ignore_errors=True))
+        self.assertEqual(work.parent, disk.resolve())
+        types = LIB.parents[3] / 'internal/types/types.go'
+        max_sid = int(re.search(r'const MaxLocalSandboxIDBytes = (\d+)', types.read_text())[1])
+        path = run / 'sandboxes' / ('s' * max_sid) / 'vsock.sock_5000'
+        self.assertLessEqual(len(os.fsencode(path)), 107)
+        path.parent.mkdir(parents=True)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(path))
+        self.assertEqual(stat.S_IMODE((Path('/tmp') / work.name).stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(work.stat().st_mode), 0o700)
+
+    def test_v2_recovery_removes_both_owned_roots(self):
+        disk = self.root / 'disk'
+        disk.mkdir()
+        self.work = disk / self.run_key
+        self.work.mkdir(mode=0o700)
+        (self.runtime / 'socket-state').touch()
+        self.record(extra_env={'TMPDIR': str(disk)})
+        recovered = self.bash(self.recovery_harness(), extra_env={'TMPDIR': str(disk)})
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(self.work.exists())
+        self.assertFalse(self.runtime.exists())
+        self.assertFalse(self.state.exists())
+
+    def test_legacy_disk_record_does_not_claim_same_key_runtime(self):
+        disk = self.root / 'disk'
+        disk.mkdir()
+        self.work = disk / self.run_key
+        self.work.mkdir(mode=0o700)
+        foreign = self.runtime / 'foreign'
+        foreign.touch()
+        self.record(extra_env={'TMPDIR': str(disk)}, version='v1')
+        recovered = self.bash(self.recovery_harness(), extra_env={'TMPDIR': str(disk)})
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(self.work.exists())
+        self.assertTrue(foreign.exists())
+
+    def test_v2_rejects_runtime_symlink_before_cleanup(self):
+        disk = self.root / 'disk'
+        disk.mkdir()
+        self.work = disk / self.run_key
+        self.work.mkdir(mode=0o700)
+        foreign = self.root / 'foreign'
+        foreign.mkdir(mode=0o700)
+        marker = foreign / 'keep'
+        marker.touch()
+        self.runtime.rmdir()
+        self.runtime.symlink_to(foreign, target_is_directory=True)
+        self.record(extra_env={'TMPDIR': str(disk)})
+        refused = self.bash(self.recovery_harness(), extra_env={'TMPDIR': str(disk)})
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('unsafe execute runtime directory', refused.stderr)
+        self.assertTrue(marker.exists())
+        self.assertTrue(self.state.exists())
+        self.assertFalse(self.log.exists())
+
+    def test_normal_cleanup_removes_only_matching_two_root_record(self):
+        disk = self.root / 'disk'
+        disk.mkdir()
+        self.work = disk / self.run_key
+        self.work.mkdir(mode=0o700)
+        environment = {'TMPDIR': str(disk)}
+        self.record(extra_env=environment)
+        refused = self.bash('execute_state_remove_work wrong-record\n', extra_env=environment)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertTrue(self.runtime.exists())
+        removed = self.bash('execute_state_remove_work "$(cat "$KUASAR_EXECUTE_STATE_PATH")"\n', extra_env=environment)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertFalse(self.work.exists())
+        self.assertFalse(self.runtime.exists())
+        self.assertTrue(self.state.exists(), 'resource finish must still verify the remaining topology')
+
+    def test_work_collision_preserves_existing_disk_directory(self):
+        disk = self.root / 'disk'
+        disk.mkdir()
+        existing = disk / self.run_key
+        existing.mkdir()
+        marker = existing / 'keep'
+        marker.touch()
+        prefix = 'mktemp() { printf "%s\\n" ' + shlex.quote(str(self.runtime)) + '; }\n'
+        refused = self.bash(prefix + 'execute_state_create_work\n', extra_env={'TMPDIR': str(disk)})
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertTrue(marker.exists())
+        self.assertFalse(self.runtime.exists())
 
     def test_no_state_is_a_noop_even_without_connector_binary(self):
         result = self.bash('execute_state_recover /does/not/exist\n')
